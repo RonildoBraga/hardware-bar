@@ -37,14 +37,17 @@ if ($schtasksExit -ne 0) {
     exit $schtasksExit
 }
 
-# Verify the task now exists.
-$task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-if (-not $task) {
-    Write-Host "ERROR: task not found after registration." -ForegroundColor Red
+# Verify the task now exists. Use schtasks.exe rather than Get-ScheduledTask —
+# the ScheduledTasks CIM cmdlet is known to fail with "file not found" on some
+# systems when there is an unrelated malformed task in the same folder.
+& schtasks.exe /Query /TN $name /FO LIST 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: task not found after registration (schtasks /Query exit $LASTEXITCODE)." -ForegroundColor Red
     exit 1
 }
 
 Write-Host "Task registered and verified." -ForegroundColor Green
-$task | Format-List TaskName, TaskPath, State,
-    @{N='RunLevel';E={$_.Principal.RunLevel}},
-    @{N='UserId';  E={$_.Principal.UserId}}
+Write-Host ""
+& schtasks.exe /Query /TN $name /XML 2>$null |
+    Select-String -Pattern "RunLevel|UserId|LogonTrigger|<Enabled>true" |
+    ForEach-Object { "  " + $_.Line.Trim() }
