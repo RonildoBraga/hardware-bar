@@ -37,13 +37,19 @@ class DiskSpec:
     physname: str
     lhm_model: str
     lhm_index: int = 0
+    always_show_io: bool = False  # True → R/W always rendered (stable bar width)
 
 DISKS: list[DiskSpec] = [
-    DiskSpec("C", "PhysicalDrive0", "CT1000P2SSD8",   0),  # P2 NVMe (OS)
-    DiskSpec("D", "PhysicalDrive3", "CT2000T500SSD8", 0),  # T500 NVMe
-    DiskSpec("E", "PhysicalDrive1", "CT2000BX500SSD1", 0),  # BX500 SATA #1
-    DiskSpec("F", "PhysicalDrive2", "CT2000BX500SSD1", 1),  # BX500 SATA #2
+    DiskSpec("C", "PhysicalDrive0", "CT1000P2SSD8",    0, always_show_io=True),   # P2 NVMe (OS)
+    DiskSpec("D", "PhysicalDrive3", "CT2000T500SSD8",  0, always_show_io=True),   # T500 NVMe (active)
+    DiskSpec("E", "PhysicalDrive1", "CT2000BX500SSD1", 0),                         # BX500 SATA #1 (bulk)
+    DiskSpec("F", "PhysicalDrive2", "CT2000BX500SSD1", 1),                         # BX500 SATA #2 (bulk)
 ]
+
+# Motherboard fan wiring (Nuvoton NCT6798D on this B660-I).
+# LHM reports each header as "Fan #N"; these map to actual fan headers per build.
+AIO_FAN_NUMBER: int | None = 6       # AIO pump tacho on header #6
+CASE_FAN_NUMBERS: list[int] = [2]    # case fans, shown in the FAN group
 
 # Color thresholds: value >= threshold paints that colour. Order matters.
 THRESHOLDS = {
@@ -72,14 +78,19 @@ class Sample:
     cpu_pct: float | None = None
     cpu_temp_c: float | None = None
     cpu_power_w: float | None = None
+    cpu_clock_ghz: float | None = None
     gpu_pct: float | None = None
     gpu_temp_c: float | None = None
     gpu_vram_used_gb: float | None = None
     gpu_vram_total_gb: float | None = None
     gpu_power_w: float | None = None
+    gpu_fan_rpm: float | None = None
+    gpu_clock_ghz: float | None = None
     ram_used_gb: float | None = None
     ram_total_gb: float | None = None
     disks: list[DiskReading] | None = None
+    aio_rpm: float | None = None
+    case_fans: list[tuple[int, float | None]] | None = None  # [(fan_number, rpm)]
     net_down_mbps: float | None = None
     net_up_mbps: float | None = None
 
@@ -106,6 +117,14 @@ class Poller:
         # cpu %
         try:
             s.cpu_pct = psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+        # cpu clock (MHz average across cores) -> GHz
+        try:
+            freq = psutil.cpu_freq()
+            if freq and freq.current:
+                s.cpu_clock_ghz = freq.current / 1000.0
         except Exception:
             pass
 
@@ -160,6 +179,12 @@ class Poller:
                     s.gpu_power_w = pynvml.nvmlDeviceGetPowerUsage(self._gpu_handle) / 1000.0
                 except pynvml.NVMLError:
                     pass
+                try:
+                    s.gpu_clock_ghz = pynvml.nvmlDeviceGetClockInfo(
+                        self._gpu_handle, pynvml.NVML_CLOCK_GRAPHICS
+                    ) / 1000.0
+                except pynvml.NVMLError:
+                    pass
             except pynvml.NVMLError:
                 pass
 
@@ -170,6 +195,11 @@ class Poller:
             tree = r.json()
             s.cpu_temp_c = _find_cpu_package_temp(tree)
             s.cpu_power_w = _find_cpu_package_power(tree)
+            s.gpu_fan_rpm = _find_gpu_fan_avg(tree)
+            s.case_fans = _find_case_fans(tree, CASE_FAN_NUMBERS)
+            if AIO_FAN_NUMBER is not None:
+                aio_list = _find_case_fans(tree, [AIO_FAN_NUMBER])
+                s.aio_rpm = aio_list[0][1] if aio_list else None
             if s.disks:
                 _attach_disk_temps(tree, s.disks)
         except (requests.RequestException, ValueError):
@@ -232,6 +262,40 @@ def _find_cpu_package_power(tree: dict) -> float | None:
         if ntype == "power" and "package" in text:
             return _parse_lhm_value(node.get("Value"))
     return None
+
+
+def _find_gpu_fan_avg(tree: dict) -> float | None:
+    """Return the average RPM across all GPU fans (e.g. 'GPU Fan 1', 'GPU Fan 2')."""
+    rpms: list[float] = []
+    for node in _walk(tree):
+        if (node.get("Type") or "").lower() != "fan":
+            continue
+        text = (node.get("Text") or "").lower()
+        if text.startswith("gpu fan"):
+            val = _parse_lhm_value(node.get("Value"))
+            if val is not None:
+                rpms.append(val)
+    return sum(rpms) / len(rpms) if rpms else None
+
+
+def _find_case_fans(tree: dict, fan_numbers: list[int]) -> list[tuple[int, float | None]]:
+    """Return [(fan_number, rpm)] for the given motherboard Fan #N sensors."""
+    by_number: dict[int, float] = {}
+    for node in _walk(tree):
+        if (node.get("Type") or "").lower() != "fan":
+            continue
+        text = (node.get("Text") or "").strip()
+        # Match "Fan #N" (motherboard fans) — skip "GPU Fan N"
+        if not text.lower().startswith("fan #"):
+            continue
+        try:
+            n = int(text.split("#", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        val = _parse_lhm_value(node.get("Value"))
+        if val is not None:
+            by_number[n] = val
+    return [(n, by_number.get(n)) for n in fan_numbers]
 
 
 def _attach_disk_temps(tree: dict, disks: list[DiskReading]) -> None:
@@ -315,16 +379,22 @@ def render(s: Sample) -> str:
     cpu_parts = [
         "CPU",
         _colored(_fmt(s.cpu_pct, "%"), _color_for("cpu_pct", s.cpu_pct)),
+    ]
+    if s.cpu_clock_ghz is not None:
+        cpu_parts.append(f"{s.cpu_clock_ghz:.1f}G")
+    cpu_parts.extend([
         _colored(_fmt(s.cpu_temp_c, "°C"), _color_for("cpu_temp_c", s.cpu_temp_c)),
         _fmt(s.cpu_power_w, "W"),
-    ]
+    ])
 
     # GPU group
     gpu_parts = [
         "GPU",
         _colored(_fmt(s.gpu_pct, "%"), _color_for("gpu_pct", s.gpu_pct)),
-        _colored(_fmt(s.gpu_temp_c, "°C"), _color_for("gpu_temp_c", s.gpu_temp_c)),
     ]
+    if s.gpu_clock_ghz is not None:
+        gpu_parts.append(f"{s.gpu_clock_ghz:.1f}G")
+    gpu_parts.append(_colored(_fmt(s.gpu_temp_c, "°C"), _color_for("gpu_temp_c", s.gpu_temp_c)))
     if s.gpu_vram_used_gb is not None and s.gpu_vram_total_gb is not None:
         gpu_parts.append(f"{s.gpu_vram_used_gb:.1f}/{s.gpu_vram_total_gb:.0f}G")
     gpu_parts.append(_fmt(s.gpu_power_w, "W"))
@@ -337,20 +407,50 @@ def render(s: Sample) -> str:
     else:
         ram = "RAM --"
 
-    # Disks — one compact group per drive, R/W only when non-zero
+    # Disks — one compact group per drive; R/W always shown for "active" disks,
+    # hidden-when-idle for bulk storage disks.
+    spec_by_label = {spec.label: spec for spec in DISKS}
     disk_groups: list[str] = []
     for reading in s.disks or []:
         temp_fmt = _fmt(reading.temp_c, "°C")
         parts = [reading.label, _colored(temp_fmt, _color_for("disk_temp_c", reading.temp_c))]
         r = reading.read_mbps or 0.0
         w = reading.write_mbps or 0.0
-        if r >= 0.1 or w >= 0.1:
+        always = spec_by_label.get(reading.label, DiskSpec("", "", "")).always_show_io
+        if always or r >= 0.1 or w >= 0.1:
             parts.append(f"R{_fmt(r, 'M', 1)} W{_fmt(w, 'M', 1)}")
         disk_groups.append(" ".join(parts))
 
-    net = f"↓{_fmt(s.net_down_mbps, 'M', 1)} ↑{_fmt(s.net_up_mbps, 'M', 1)}"
+    # Network
+    net = f"NET ↓{_fmt(s.net_down_mbps, 'M', 1)} ↑{_fmt(s.net_up_mbps, 'M', 1)}"
 
-    sections = [" ".join(cpu_parts), " ".join(gpu_parts), ram, *disk_groups, net]
+    # AIO pump
+    aio_sections: list[str] = []
+    if s.aio_rpm is not None:
+        aio_sections.append(f"AIO {s.aio_rpm:.0f}rpm")
+
+    # Case fans — plain RPMs (no #N prefix since there's only one in most configs)
+    fan_sections: list[str] = []
+    if s.case_fans:
+        rpm_texts = [f"{rpm:.0f}" if rpm is not None else "--" for _, rpm in s.case_fans]
+        fan_sections.append("FAN " + " ".join(rpm_texts))
+
+    # GPU fan — sits next to the case fans
+    gpu_fan_sections: list[str] = []
+    if s.gpu_fan_rpm is not None:
+        gpu_fan_sections.append(f"GPU-FAN {s.gpu_fan_rpm:.0f}rpm")
+
+    # Order: CPU, GPU, RAM, NET, AIO, FAN, GPU-FAN, disks (far right)
+    sections = [
+        " ".join(cpu_parts),
+        " ".join(gpu_parts),
+        ram,
+        net,
+        *aio_sections,
+        *fan_sections,
+        *gpu_fan_sections,
+        *disk_groups,
+    ]
     return "&nbsp;&nbsp;&nbsp;".join(sections)
 
 
@@ -368,6 +468,9 @@ class Bar(QWidget):
 
         self.label = QLabel("initializing…")
         self.label.setTextFormat(Qt.TextFormat.RichText)
+        # Rich-text QLabel intercepts mouse events; make it transparent to them
+        # so drag (press/move/release) reaches the parent Bar widget.
+        self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         font_family = (
             "Cascadia Mono" if "Cascadia Mono" in QFontDatabase.families() else "Consolas"
         )
