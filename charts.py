@@ -30,6 +30,7 @@ from typing import Callable
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QVBoxLayout, QWidget
 
 from bar import Poller, Sample
@@ -286,6 +287,47 @@ class ChartWindow(QWidget):
             self.move(screen.center().x() - WINDOW_W // 2, screen.top() + 60)
 
 
+class SingleInstance:
+    """One-instance-per-metric using Qt's QLocalServer (named pipes on Windows).
+
+    - If another instance for this metric is already running, call signal_existing()
+      to ask it to close, and this process exits.
+    - Otherwise call become_primary() to listen for future close requests.
+    """
+
+    def __init__(self, metric: str) -> None:
+        self._name = f"hardware-bar-chart-{metric}"
+        self._server: QLocalServer | None = None
+
+    def signal_existing(self) -> bool:
+        sock = QLocalSocket()
+        sock.connectToServer(self._name)
+        if not sock.waitForConnected(300):
+            return False
+        sock.write(b"close")
+        sock.flush()
+        sock.waitForBytesWritten(300)
+        sock.disconnectFromServer()
+        return True
+
+    def become_primary(self, on_close: Callable[[], None]) -> None:
+        QLocalServer.removeServer(self._name)  # clear stale Unix socket (no-op on Windows)
+        self._server = QLocalServer()
+        if not self._server.listen(self._name):
+            return
+
+        def _on_new_connection() -> None:
+            while self._server is not None and self._server.hasPendingConnections():
+                conn = self._server.nextPendingConnection()
+                conn.waitForReadyRead(300)
+                msg = bytes(conn.readAll()).decode("utf-8", "ignore")
+                conn.disconnectFromServer()
+                if "close" in msg:
+                    on_close()
+
+        self._server.newConnection.connect(_on_new_connection)
+
+
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in METRICS:
         print("Usage: charts.py <metric>")
@@ -294,7 +336,15 @@ def main() -> int:
 
     metric = sys.argv[1]
     app = QApplication(sys.argv)
+
+    # Toggle: if another instance for this metric is running, tell it to close
+    # and exit this one silently.
+    single = SingleInstance(metric)
+    if single.signal_existing():
+        return 0
+
     win = ChartWindow(metric, METRICS[metric])
+    single.become_primary(win.close)
     win.show()
     return app.exec()
 
