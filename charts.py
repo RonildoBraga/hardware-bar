@@ -21,7 +21,9 @@ rolling view. Press Esc or right-click → Close to dismiss.
 
 from __future__ import annotations
 
+import logging
 import sys
+import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +45,25 @@ BG = (20, 20, 22, 220)
 TEXT = "#e6e6e6"
 GRID_ALPHA = 0.15
 CONFIG_DIR = Path(__file__).with_name(".charts")
+LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-charts.log"
+
+log = logging.getLogger("charts")
+
+
+def _setup_logging() -> None:
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
+                            datefmt="%H:%M:%S")
+    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    try:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+    except Exception:
+        pass  # pythonw has no stderr
 
 
 @dataclass
@@ -300,35 +321,59 @@ class SingleInstance:
         self._server: QLocalServer | None = None
 
     def signal_existing(self) -> bool:
+        log.info("signal_existing: trying to connect to %s", self._name)
         sock = QLocalSocket()
         sock.connectToServer(self._name)
-        if not sock.waitForConnected(300):
+        if not sock.waitForConnected(500):
+            log.info("  no existing instance (errno=%s, err=%s)",
+                     sock.error(), sock.errorString())
             return False
+        log.info("  existing instance found — sending 'close'")
         sock.write(b"close")
         sock.flush()
-        sock.waitForBytesWritten(300)
+        sock.waitForBytesWritten(500)
         sock.disconnectFromServer()
+        sock.waitForDisconnected(500)
         return True
 
     def become_primary(self, on_close: Callable[[], None]) -> None:
-        QLocalServer.removeServer(self._name)  # clear stale Unix socket (no-op on Windows)
+        log.info("become_primary: claiming %s", self._name)
+        removed = QLocalServer.removeServer(self._name)
+        log.info("  removeServer returned %s", removed)
         self._server = QLocalServer()
         if not self._server.listen(self._name):
+            log.error("  listen FAILED: %s", self._server.errorString())
+            self._server = None
             return
+        log.info("  now listening for close requests")
 
         def _on_new_connection() -> None:
             while self._server is not None and self._server.hasPendingConnections():
                 conn = self._server.nextPendingConnection()
-                conn.waitForReadyRead(300)
+                conn.waitForReadyRead(500)
                 msg = bytes(conn.readAll()).decode("utf-8", "ignore")
+                log.info("received message: %r", msg)
                 conn.disconnectFromServer()
                 if "close" in msg:
+                    log.info("  -> tearing down server + calling on_close")
+                    # Close & unregister BEFORE closing the window, so the next
+                    # launch sees no server and becomes primary cleanly.
+                    try:
+                        self._server.close()
+                    except Exception as e:
+                        log.warning("  server.close() raised: %s", e)
+                    QLocalServer.removeServer(self._name)
+                    self._server = None
                     on_close()
 
         self._server.newConnection.connect(_on_new_connection)
 
 
 def main() -> int:
+    _setup_logging()
+    log.info("=" * 60)
+    log.info("launch argv=%s  log=%s", sys.argv[1:], LOG_PATH)
+
     if len(sys.argv) != 2 or sys.argv[1] not in METRICS:
         print("Usage: charts.py <metric>")
         print("Available metrics: " + ", ".join(METRICS))
@@ -341,12 +386,17 @@ def main() -> int:
     # and exit this one silently.
     single = SingleInstance(metric)
     if single.signal_existing():
+        log.info("signaled existing instance — exiting")
         return 0
 
+    log.info("no existing instance for %s — becoming primary", metric)
     win = ChartWindow(metric, METRICS[metric])
     single.become_primary(win.close)
     win.show()
-    return app.exec()
+    log.info("entering Qt event loop")
+    rc = app.exec()
+    log.info("event loop exited with rc=%s", rc)
+    return rc
 
 
 if __name__ == "__main__":
