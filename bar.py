@@ -15,6 +15,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import ctypes
+from ctypes import wintypes
+
 import psutil
 import pynvml
 import requests
@@ -93,6 +96,57 @@ class Sample:
     net_up_mbps: float | None = None
 
 
+class CpuUtility:
+    """Reads '\\Processor Information(_Total)\\% Processor Utility' via Windows PDH.
+
+    This is the same counter Task Manager shows for CPU on Windows 8+ — it
+    accounts for frequency scaling, unlike psutil.cpu_percent() which maps to
+    the older '% Processor Time' counter (which is just "time not idle" and
+    reads as near-zero on modern CPUs parked at low clocks).
+    """
+
+    _PDH_FMT_DOUBLE = 0x00000200
+    _COUNTER_PATH   = "\\Processor Information(_Total)\\% Processor Utility"
+
+    class _Value(ctypes.Structure):
+        _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+    def __init__(self) -> None:
+        self._ok = False
+        try:
+            self._pdh = ctypes.WinDLL("pdh.dll")
+            self._query = wintypes.HANDLE()
+            self._counter = wintypes.HANDLE()
+
+            if self._pdh.PdhOpenQueryW(None, 0, ctypes.byref(self._query)) != 0:
+                return
+            if self._pdh.PdhAddEnglishCounterW(
+                self._query, self._COUNTER_PATH, 0, ctypes.byref(self._counter)
+            ) != 0:
+                return
+            # First collect establishes the baseline; first sample() may be 0.
+            self._pdh.PdhCollectQueryData(self._query)
+            self._ok = True
+        except Exception:
+            pass
+
+    def sample(self) -> float | None:
+        if not self._ok:
+            return None
+        try:
+            if self._pdh.PdhCollectQueryData(self._query) != 0:
+                return None
+            val = self._Value()
+            res = self._pdh.PdhGetFormattedCounterValue(
+                self._counter, self._PDH_FMT_DOUBLE, None, ctypes.byref(val)
+            )
+            if res != 0:
+                return None
+            return val.doubleValue
+        except Exception:
+            return None
+
+
 class Poller:
     def __init__(self) -> None:
         self._nvml_ok = False
@@ -106,14 +160,19 @@ class Poller:
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.monotonic()
 
+        self._cpu_utility = CpuUtility()
+
     def sample(self) -> Sample:
         s = Sample()
 
-        # cpu %
-        try:
-            s.cpu_pct = psutil.cpu_percent(interval=None)
-        except Exception:
-            pass
+        # cpu %: prefer Processor Utility (matches Task Manager on Win8+),
+        # fall back to psutil's Processor Time if PDH isn't available.
+        s.cpu_pct = self._cpu_utility.sample()
+        if s.cpu_pct is None:
+            try:
+                s.cpu_pct = psutil.cpu_percent(interval=None)
+            except Exception:
+                pass
 
         # cpu clock (MHz average across cores) -> GHz
         try:
