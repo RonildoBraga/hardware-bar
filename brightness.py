@@ -16,11 +16,33 @@ Examples:
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
+import tempfile
 from ctypes import wintypes
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 from monitorcontrol import get_monitors, Monitor, VCPError
+
+LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-brightness.log"
+log = logging.getLogger("brightness")
+
+
+def _setup_logging() -> None:
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
+                            datefmt="%H:%M:%S")
+    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    try:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+    except Exception:
+        pass  # pythonw has no stderr
 
 # -------- Win32 DisplayConfig API via ctypes -----------------------------
 
@@ -322,10 +344,12 @@ def list_displays() -> int:
 def adjust(index: int, delta: int) -> int:
     rows = build_display_index()
     if index < 0 or index >= len(rows):
-        print(f"Invalid display index {index}. Valid: 0..{len(rows)-1}")
+        log.error("invalid display index %d (valid: 0..%d)", index, len(rows) - 1)
         return 2
     target, m = rows[index]
     hdr_on = is_hdr_enabled(target)
+    log.info("adjust: index=%d display=%s hdr=%s delta=%+d",
+             index, target.name, hdr_on, delta)
 
     if hdr_on:
         cur_wl = get_sdr_white_level(target)
@@ -333,29 +357,32 @@ def adjust(index: int, delta: int) -> int:
         new_pct = max(0, min(100, cur_pct + delta))
         new_wl = sdr_pct_to_wl(new_pct)
         ok = set_sdr_white_level(target, new_wl)
-        status = "ok" if ok else "FAILED"
-        print(f"[{index}] {target.name} (HDR): SDR white level {cur_wl} -> {new_wl}  "
-              f"({cur_pct}% -> {new_pct}%)  {status}")
+        log.info("  HDR path: sdr_wl %d -> %d (%d%% -> %d%%)  result=%s",
+                 cur_wl, new_wl, cur_pct, new_pct, "ok" if ok else "FAILED")
         return 0 if ok else 1
 
     # SDR path: DDC/CI
     if m is None:
-        print(f"[{index}] {target.name} (SDR): no DDC/CI device available")
+        log.error("  SDR path: no DDC/CI device available for this display")
         return 1
     try:
         with m:
             cur = m.get_luminance()
             new = max(0, min(100, cur + delta))
             m.set_luminance(new)
-            print(f"[{index}] {target.name} (SDR): DDC/CI brightness {cur} -> {new}")
+            log.info("  SDR path: DDC/CI brightness %d -> %d", cur, new)
             return 0
     except VCPError as e:
-        print(f"[{index}] {target.name} (SDR): DDC/CI not available ({e})")
+        log.error("  SDR path: DDC/CI error: %s", e)
         return 1
 
 
 def main() -> int:
+    _setup_logging()
     args = sys.argv[1:]
+    log.info("=" * 50)
+    log.info("launch argv=%s  log=%s", args, LOG_PATH)
+
     if not args or args[0] in ("-h", "--help", "help"):
         print(__doc__)
         return 0
@@ -367,7 +394,7 @@ def main() -> int:
     try:
         return adjust(int(args[0]), int(args[1]))
     except ValueError:
-        print("Both index and delta must be integers.")
+        log.error("both index and delta must be integers")
         return 2
 
 
