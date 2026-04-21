@@ -3,3 +3,4 @@ psutil>=5.9
 nvidia-ml-py>=12.535
 requests>=2.31
 pyqtgraph>=0.13
+monitorcontrol>=4.2
