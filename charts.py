@@ -355,7 +355,7 @@ class SingleInstance:
                 log.info("received message: %r", msg)
                 conn.disconnectFromServer()
                 if "close" in msg:
-                    log.info("  -> tearing down server + calling on_close")
+                    log.info("  -> tearing down server + closing window + quitting app")
                     # Close & unregister BEFORE closing the window, so the next
                     # launch sees no server and becomes primary cleanly.
                     try:
@@ -365,6 +365,12 @@ class SingleInstance:
                     QLocalServer.removeServer(self._name)
                     self._server = None
                     on_close()
+                    # Explicitly quit the app — relying on quitOnLastWindowClosed
+                    # is fragile if other resources (timers, servers) keep event
+                    # loop alive. This is what let the fc55514 zombies happen.
+                    app = QApplication.instance()
+                    if app is not None:
+                        app.quit()
 
         self._server.newConnection.connect(_on_new_connection)
 
