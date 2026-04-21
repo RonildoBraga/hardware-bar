@@ -10,9 +10,10 @@ Data sources:
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import ctypes
@@ -29,6 +30,14 @@ LHM_URL = "http://localhost:8085/data.json"
 LHM_TIMEOUT_S = 0.5
 REFRESH_MS = 1000
 CONFIG_FILE = Path(__file__).with_name("config.local.json")
+
+BRIGHTNESS_HOST = "127.0.0.1"
+BRIGHTNESS_PORT = 48736
+BRIGHTNESS_TIMEOUT_S = 0.15  # fail fast if daemon is down/slow
+# Order to display brightness values in the bar. Each entry is a daemon
+# index (same as `brightness_client.py --list`). Daemon order is
+# 0=KAMN49QDQUCLA, 1=Smart TV, 2=Cintiq 16 — bar shows TV, KGN, Wacom.
+BRIGHTNESS_DISPLAY_ORDER: list[int] = [1, 0, 2]
 
 # Per-drive config.
 # psutil reports disks as PhysicalDrive<N>. LHM reports them by model name;
@@ -94,6 +103,9 @@ class Sample:
     case_fans: list[tuple[int, float | None]] | None = None  # [(fan_number, rpm)]
     net_down_mbps: float | None = None
     net_up_mbps: float | None = None
+    # Per-display brightness percent, in daemon/Display-Config order.
+    # Entry is None if that display's value is unknown (e.g. DDC unreadable).
+    brightness_pcts: list[int | None] = field(default_factory=list)
 
 
 class CpuUtility:
@@ -228,6 +240,9 @@ class Poller:
             except pynvml.NVMLError:
                 pass
 
+        # brightness daemon status — optional, silent if daemon not running
+        s.brightness_pcts = _poll_brightness()
+
         # lhm (cpu package temp, nvme ssd temp)
         try:
             r = requests.get(LHM_URL, timeout=LHM_TIMEOUT_S)
@@ -246,6 +261,46 @@ class Poller:
             pass
 
         return s
+
+
+# -------- brightness daemon ---------------------------------------------
+
+
+def _poll_brightness() -> list[int | None]:
+    """Query brightness_daemon.py for per-display percent values.
+
+    Wire format: 'status' -> '0:40 1:38 2:50' (or '0:- 1:38 ...' for unknown).
+    Returns [] if the daemon is unreachable — the bar silently hides the field.
+    """
+    try:
+        with socket.create_connection((BRIGHTNESS_HOST, BRIGHTNESS_PORT),
+                                      timeout=BRIGHTNESS_TIMEOUT_S) as s:
+            s.sendall(b"status\n")
+            reply = s.recv(512).decode("utf-8", errors="replace").strip()
+    except (OSError, socket.timeout):
+        return []
+
+    if not reply or reply.startswith("err"):
+        return []
+
+    # 'i:pct' tokens, sorted by index so output order is stable
+    parsed: dict[int, int | None] = {}
+    for tok in reply.split():
+        if ":" not in tok:
+            continue
+        i_str, v_str = tok.split(":", 1)
+        try:
+            i = int(i_str)
+        except ValueError:
+            continue
+        try:
+            parsed[i] = int(v_str)
+        except ValueError:
+            parsed[i] = None
+
+    if not parsed:
+        return []
+    return [parsed.get(i) for i in range(max(parsed) + 1)]
 
 
 # -------- LHM tree parsing ----------------------------------------------
@@ -477,6 +532,16 @@ def render(s: Sample) -> str:
     # Network
     net = f"NET ↓{_fmt(s.net_down_mbps, 'M', 1)} ↑{_fmt(s.net_up_mbps, 'M', 1)}"
 
+    # Brightness — one % per display in BRIGHTNESS_DISPLAY_ORDER. Any indices
+    # not covered by the order list fall back to daemon order at the end.
+    bri_sections: list[str] = []
+    if s.brightness_pcts:
+        order = [i for i in BRIGHTNESS_DISPLAY_ORDER if i < len(s.brightness_pcts)]
+        order += [i for i in range(len(s.brightness_pcts)) if i not in order]
+        vals = [f"{s.brightness_pcts[i]}%" if s.brightness_pcts[i] is not None else "--"
+                for i in order]
+        bri_sections.append("BRI " + " ".join(vals))
+
     # AIO pump
     aio_sections: list[str] = []
     if s.aio_rpm is not None:
@@ -493,12 +558,13 @@ def render(s: Sample) -> str:
     if s.gpu_fan_rpm is not None:
         gpu_fan_sections.append(f"GPU-FAN {s.gpu_fan_rpm:.0f}rpm")
 
-    # Order: CPU, GPU, RAM, NET, AIO, FAN, GPU-FAN, disks (far right)
+    # Order: CPU, GPU, RAM, NET, BRI, AIO, FAN, GPU-FAN, disks (far right)
     sections = [
         " ".join(cpu_parts),
         " ".join(gpu_parts),
         ram,
         net,
+        *bri_sections,
         *aio_sections,
         *fan_sections,
         *gpu_fan_sections,
