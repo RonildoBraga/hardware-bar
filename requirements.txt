@@ -1,0 +1,4 @@
+PyQt6>=6.7
+psutil>=5.9
+nvidia-ml-py>=12.535
+requests>=2.31

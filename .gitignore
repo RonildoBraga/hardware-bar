@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+vendor/LibreHardwareMonitor/
+config.local.json
+lhm-sample.json
