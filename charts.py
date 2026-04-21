@@ -8,6 +8,7 @@ Metrics:
     cpu-temp     CPU package temp °C
     gpu          GPU load %
     gpu-temp     GPU core temp °C
+    cpu-gpu      CPU utility + GPU load overlay
     ram          RAM used GB
     disk         Per-disk activity % (4 lines)
     disk-temps   Per-disk temperature (4 lines)
@@ -92,6 +93,15 @@ METRICS: dict[str, MetricSpec] = {
         y_label="°C",
         y_range=(20, 100),
         series=[("GPU", "#ff9f43", lambda s: s.gpu_temp_c)],
+    ),
+    "cpu-gpu": MetricSpec(
+        title="CPU utility + GPU load",
+        y_label="%",
+        y_range=(0, 100),
+        series=[
+            ("CPU", "#4ea1ff", lambda s: s.cpu_pct),
+            ("GPU", "#57d787", lambda s: s.gpu_pct),
+        ],
     ),
     "ram": MetricSpec(
         title="RAM used",

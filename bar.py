@@ -271,17 +271,22 @@ def _parse_lhm_value(v: str | None) -> float | None:
 
 
 def _find_cpu_package_temp(tree: dict) -> float | None:
-    best = None
+    """Return the 'CPU Package' temperature in °C. Falls back to 'Core Average'
+    if Package isn't available. Only matches nodes of Type=Temperature —
+    otherwise 'Power/CPU Package' (in watts) would be returned as the temp."""
+    core_avg = None
     for node in _walk(tree):
-        text = (node.get("Text") or "").lower()
+        if (node.get("Type") or "").lower() != "temperature":
+            continue
+        text = (node.get("Text") or "").strip().lower()
         val = _parse_lhm_value(node.get("Value"))
         if val is None:
             continue
-        if "cpu package" in text or "package" in text and "cpu" in text:
+        if text == "cpu package":
             return val
-        if "core average" in text or text.startswith("cpu core #"):
-            best = val if best is None else max(best, val)
-    return best
+        if text == "core average":
+            core_avg = val
+    return core_avg
 
 
 def _find_cpu_package_power(tree: dict) -> float | None:
