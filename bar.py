@@ -34,16 +34,14 @@ CONFIG_FILE = Path(__file__).with_name("config.local.json")
 @dataclass
 class DiskSpec:
     label: str
-    physname: str
     lhm_model: str
     lhm_index: int = 0
-    always_show_io: bool = False  # True → R/W always rendered (stable bar width)
 
 DISKS: list[DiskSpec] = [
-    DiskSpec("C", "PhysicalDrive0", "CT1000P2SSD8",    0, always_show_io=True),   # P2 NVMe (OS)
-    DiskSpec("D", "PhysicalDrive3", "CT2000T500SSD8",  0, always_show_io=True),   # T500 NVMe (active)
-    DiskSpec("E", "PhysicalDrive1", "CT2000BX500SSD1", 0),                         # BX500 SATA #1 (bulk)
-    DiskSpec("F", "PhysicalDrive2", "CT2000BX500SSD1", 1),                         # BX500 SATA #2 (bulk)
+    DiskSpec("C", "CT1000P2SSD8",    0),  # P2 NVMe (OS)
+    DiskSpec("D", "CT2000T500SSD8",  0),  # T500 NVMe
+    DiskSpec("E", "CT2000BX500SSD1", 0),  # BX500 SATA #1
+    DiskSpec("F", "CT2000BX500SSD1", 1),  # BX500 SATA #2
 ]
 
 # Motherboard fan wiring (Nuvoton NCT6798D on this B660-I).
@@ -57,7 +55,8 @@ THRESHOLDS = {
     "cpu_temp_c":  [(90, "#ff5555"), (80, "#ffcc44")],
     "gpu_pct":     [(98, "#ff5555"), (90, "#ffcc44")],
     "gpu_temp_c":  [(83, "#ff5555"), (75, "#ffcc44")],
-    "disk_temp_c": [(70, "#ff5555"), (60, "#ffcc44")],
+    "disk_temp_c":  [(70, "#ff5555"), (60, "#ffcc44")],
+    "disk_activity":[(95, "#ff5555"), (70, "#ffcc44")],
     "ram_pct":     [(90, "#ff5555"), (80, "#ffcc44")],
 }
 COLOR_DEFAULT = "#e6e6e6"
@@ -68,9 +67,8 @@ COLOR_DEFAULT = "#e6e6e6"
 @dataclass
 class DiskReading:
     label: str
-    read_mbps: float | None = None
-    write_mbps: float | None = None
     temp_c: float | None = None
+    activity_pct: float | None = None
 
 
 @dataclass
@@ -108,9 +106,6 @@ class Poller:
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.monotonic()
 
-        self._last_perdisk = psutil.disk_io_counters(perdisk=True) or {}
-        self._last_perdisk_t = time.monotonic()
-
     def sample(self) -> Sample:
         s = Sample()
 
@@ -147,22 +142,8 @@ class Poller:
         except Exception:
             pass
 
-        # per-disk i/o rates for configured disks
-        try:
-            now = time.monotonic()
-            cur = psutil.disk_io_counters(perdisk=True) or {}
-            dt = max(now - self._last_perdisk_t, 1e-6)
-            readings: list[DiskReading] = []
-            for spec in DISKS:
-                r: DiskReading = DiskReading(label=spec.label)
-                if spec.physname in cur and spec.physname in self._last_perdisk:
-                    r.read_mbps = (cur[spec.physname].read_bytes - self._last_perdisk[spec.physname].read_bytes) / dt / 1024**2
-                    r.write_mbps = (cur[spec.physname].write_bytes - self._last_perdisk[spec.physname].write_bytes) / dt / 1024**2
-                readings.append(r)
-            s.disks = readings
-            self._last_perdisk, self._last_perdisk_t = cur, now
-        except Exception:
-            pass
+        # initialise disk readings (temp + activity are filled from LHM below)
+        s.disks = [DiskReading(label=spec.label) for spec in DISKS]
 
         # gpu via nvml
         if self._nvml_ok:
@@ -201,7 +182,7 @@ class Poller:
                 aio_list = _find_case_fans(tree, [AIO_FAN_NUMBER])
                 s.aio_rpm = aio_list[0][1] if aio_list else None
             if s.disks:
-                _attach_disk_temps(tree, s.disks)
+                _attach_disk_sensors(tree, s.disks)
         except (requests.RequestException, ValueError):
             pass
 
@@ -298,38 +279,37 @@ def _find_case_fans(tree: dict, fan_numbers: list[int]) -> list[tuple[int, float
     return [(n, by_number.get(n)) for n in fan_numbers]
 
 
-def _attach_disk_temps(tree: dict, disks: list[DiskReading]) -> None:
-    """For each DISKS spec, find its Nth matching LHM device node and pull a temp reading."""
-    # Build a map from (lhm_model, occurrence_index) -> temperature.
-    # Scan storage devices in tree-order. A device node is one whose Text contains a known
-    # disk model substring and which has a "Temperature" typed descendant.
-    model_occurrence: dict[str, int] = {}  # tracks how many times we've seen each model so far
-    found: dict[tuple[str, int], float] = {}
+def _attach_disk_sensors(tree: dict, disks: list[DiskReading]) -> None:
+    """For each DISKS spec, find its Nth matching LHM device node and pull
+    the primary temperature + 'Total Activity' load % from its subtree."""
+    model_occurrence: dict[str, int] = {}
+    found: dict[tuple[str, int], tuple[float | None, float | None]] = {}
 
     for node in _walk(tree):
         text = (node.get("Text") or "").strip()
-        # Only consider top-ish device nodes — those whose text contains a configured model.
         for spec in DISKS:
             if spec.lhm_model not in text:
                 continue
-            # Make sure this node has temperature children (to avoid false positives).
             temp = _first_disk_temp(node)
-            if temp is None:
-                continue
+            activity = _first_disk_activity(node)
+            if temp is None and activity is None:
+                continue  # not actually a storage device node
             idx = model_occurrence.get(spec.lhm_model, 0)
-            found[(spec.lhm_model, idx)] = temp
+            found[(spec.lhm_model, idx)] = (temp, activity)
             model_occurrence[spec.lhm_model] = idx + 1
-            break  # this node is one model — no need to test remaining specs
+            break
 
     for reading in disks:
         spec = next((d for d in DISKS if d.label == reading.label), None)
         if spec is None:
             continue
-        reading.temp_c = found.get((spec.lhm_model, spec.lhm_index))
+        pair = found.get((spec.lhm_model, spec.lhm_index))
+        if pair is not None:
+            reading.temp_c, reading.activity_pct = pair
 
 
 def _first_disk_temp(device_node: dict) -> float | None:
-    """Return the primary temperature reading from a storage device subtree.
+    """Primary temperature from a storage-device subtree.
     Prefers 'Composite Temperature' (NVMe), falls back to plain 'Temperature' (SATA)."""
     composite: float | None = None
     plain: float | None = None
@@ -345,6 +325,17 @@ def _first_disk_temp(device_node: dict) -> float | None:
         elif text == "temperature":
             plain = val
     return composite if composite is not None else plain
+
+
+def _first_disk_activity(device_node: dict) -> float | None:
+    """Return the 'Total Activity' Load % from a storage-device subtree."""
+    for node in _walk(device_node):
+        if (node.get("Type") or "").lower() != "load":
+            continue
+        text = (node.get("Text") or "").strip().lower()
+        if text == "total activity":
+            return _parse_lhm_value(node.get("Value"))
+    return None
 
 
 # -------- ui -------------------------------------------------------------
@@ -407,18 +398,16 @@ def render(s: Sample) -> str:
     else:
         ram = "RAM --"
 
-    # Disks — one compact group per drive; R/W always shown for "active" disks,
-    # hidden-when-idle for bulk storage disks.
-    spec_by_label = {spec.label: spec for spec in DISKS}
+    # Disks — per drive: label, temp, activity% (LHM "Total Activity" = disk busy time)
     disk_groups: list[str] = []
     for reading in s.disks or []:
         temp_fmt = _fmt(reading.temp_c, "°C")
-        parts = [reading.label, _colored(temp_fmt, _color_for("disk_temp_c", reading.temp_c))]
-        r = reading.read_mbps or 0.0
-        w = reading.write_mbps or 0.0
-        always = spec_by_label.get(reading.label, DiskSpec("", "", "")).always_show_io
-        if always or r >= 0.1 or w >= 0.1:
-            parts.append(f"R{_fmt(r, 'M', 1)} W{_fmt(w, 'M', 1)}")
+        act_fmt  = _fmt(reading.activity_pct, "%")
+        parts = [
+            reading.label,
+            _colored(temp_fmt, _color_for("disk_temp_c", reading.temp_c)),
+            _colored(act_fmt,  _color_for("disk_activity", reading.activity_pct)),
+        ]
         disk_groups.append(" ".join(parts))
 
     # Network
