@@ -10,5 +10,5 @@ if "%~1"=="" (
     pause
     exit /b 1
 )
-cd /d "%~dp0"
-start "" ".venv\Scripts\pythonw.exe" charts.py %1
+cd /d "%~dp0..\.."
+start "" ".venv\Scripts\pythonw.exe" -m bar.charts %1

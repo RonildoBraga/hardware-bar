@@ -3,5 +3,8 @@ __pycache__/
 *.pyc
 vendor/LibreHardwareMonitor/
 config.local.json
+audio_filter.local.json
 .charts/
 lhm-sample.json
+mysetup.txt
+.claude/

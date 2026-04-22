@@ -24,7 +24,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-import brightness as br  # reuse the existing helpers
+from . import core as br  # reuse the existing helpers
 
 HOST = "127.0.0.1"
 PORT = 48736

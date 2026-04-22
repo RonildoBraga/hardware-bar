@@ -8,5 +8,5 @@ if "%~1"=="" (
     pause
     exit /b 1
 )
-cd /d "%~dp0"
-".venv\Scripts\python.exe" charts.py %1
+cd /d "%~dp0..\.."
+".venv\Scripts\python.exe" -m bar.charts %1

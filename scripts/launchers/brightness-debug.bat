@@ -9,5 +9,5 @@ if "%~1"=="" (
     pause
     exit /b 1
 )
-cd /d "%~dp0"
-".venv\Scripts\python.exe" brightness.py %*
+cd /d "%~dp0..\.."
+".venv\Scripts\python.exe" -m brightness %*

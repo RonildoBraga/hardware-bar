@@ -35,6 +35,11 @@ from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QVBoxLayout, QWidget
 
+# Allow direct-file invocation (e.g. `pythonw.exe C:\...\bar\charts.py cpu`)
+# by Loupedeck bindings that have no working-directory field.
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from bar import Poller, Sample
 
 WINDOW_W = 460
@@ -44,7 +49,7 @@ REFRESH_MS = 1000
 BG = (20, 20, 22, 220)
 TEXT = "#e6e6e6"
 GRID_ALPHA = 0.15
-CONFIG_DIR = Path(__file__).with_name(".charts")
+CONFIG_DIR = Path(__file__).resolve().parent.parent / ".charts"
 LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-charts.log"
 
 log = logging.getLogger("charts")

@@ -10,11 +10,14 @@ Data sources:
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import ctypes
 from ctypes import wintypes
@@ -22,14 +25,43 @@ from ctypes import wintypes
 import psutil
 import pynvml
 import requests
+
+# Allow direct-file invocation (e.g. `pythonw.exe C:\...\bar\main.py`) by
+# Loupedeck bindings that only have File + Arguments fields and no
+# working-directory field — put the project root on sys.path ourselves.
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import audio
+import nightlight
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QAction, QFont, QFontDatabase
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QWidget, QHBoxLayout
 
 LHM_URL = "http://localhost:8085/data.json"
 LHM_TIMEOUT_S = 0.5
 REFRESH_MS = 1000
-CONFIG_FILE = Path(__file__).with_name("config.local.json")
+CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.local.json"
+LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar.log"
+
+log = logging.getLogger("bar")
+
+
+def _setup_logging() -> None:
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
+                            datefmt="%H:%M:%S")
+    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    try:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+    except Exception:
+        pass  # pythonw has no stderr
 
 BRIGHTNESS_HOST = "127.0.0.1"
 BRIGHTNESS_PORT = 48736
@@ -106,6 +138,12 @@ class Sample:
     # Per-display brightness percent, in daemon/Display-Config order.
     # Entry is None if that display's value is unknown (e.g. DDC unreadable).
     brightness_pcts: list[int | None] = field(default_factory=list)
+    # Windows Night Light state; None if the registry key is unreadable.
+    nightlight_on: bool | None = None
+    # Default audio output state; each field is None if the query failed.
+    volume_pct: int | None = None
+    volume_muted: bool | None = None
+    audio_device: str | None = None
 
 
 class CpuUtility:
@@ -242,6 +280,18 @@ class Poller:
 
         # brightness daemon status — optional, silent if daemon not running
         s.brightness_pcts = _poll_brightness()
+
+        # night light — cheap registry read; None if key absent
+        s.nightlight_on = nightlight.is_enabled()
+
+        # audio — COM calls are fast; defensive against device transitions
+        try:
+            status = audio.get_status()
+            s.volume_pct = status["volume"]
+            s.volume_muted = status["mute"]
+            s.audio_device = status["device"]
+        except Exception:
+            pass
 
         # lhm (cpu package temp, nvme ssd temp)
         try:
@@ -468,6 +518,14 @@ def _fmt(val: float | None, unit: str, digits: int = 0) -> str:
     return f"{val:.{digits}f}{unit}"
 
 
+def _abbreviate_device(name: str, max_len: int = 16) -> str:
+    """Strip the " (driver name)" suffix Windows appends, then cap length."""
+    paren = name.find(" (")
+    if paren > 0:
+        name = name[:paren]
+    return name if len(name) <= max_len else name[:max_len - 1] + "…"
+
+
 def _color_for(key: str, val: float | None) -> str:
     if val is None:
         return COLOR_DEFAULT
@@ -542,6 +600,24 @@ def render(s: Sample) -> str:
                 for i in order]
         bri_sections.append("BRI " + " ".join(vals))
 
+    # Night Light — warm colour when on to echo the actual tint
+    nl_sections: list[str] = []
+    if s.nightlight_on is not None:
+        if s.nightlight_on:
+            nl_sections.append("NL " + _colored("on", "#ffcc44"))
+        else:
+            nl_sections.append("NL off")
+
+    # Audio — VOL % (red if muted) and OUT <device name abbreviated>
+    audio_sections: list[str] = []
+    if s.volume_pct is not None:
+        if s.volume_muted:
+            audio_sections.append("VOL " + _colored("MUTE", "#ff5555"))
+        else:
+            audio_sections.append(f"VOL {s.volume_pct}%")
+    if s.audio_device:
+        audio_sections.append(f"OUT {_abbreviate_device(s.audio_device)}")
+
     # AIO pump
     aio_sections: list[str] = []
     if s.aio_rpm is not None:
@@ -558,13 +634,15 @@ def render(s: Sample) -> str:
     if s.gpu_fan_rpm is not None:
         gpu_fan_sections.append(f"GPU-FAN {s.gpu_fan_rpm:.0f}rpm")
 
-    # Order: CPU, GPU, RAM, NET, BRI, AIO, FAN, GPU-FAN, disks (far right)
+    # Order: CPU, GPU, RAM, NET, BRI, NL, VOL, OUT, AIO, FAN, GPU-FAN, disks
     sections = [
         " ".join(cpu_parts),
         " ".join(gpu_parts),
         ram,
         net,
         *bri_sections,
+        *nl_sections,
+        *audio_sections,
         *aio_sections,
         *fan_sections,
         *gpu_fan_sections,
@@ -656,11 +734,88 @@ class Bar(QWidget):
             self.move(screen.right() - 620, screen.top() + 8)
 
 
+class SingleInstance:
+    """One-instance bar toggle via QLocalServer (named pipe on Windows).
+
+    - If a bar is already running, signal_existing() tells it to close and
+      this process exits silently.
+    - Otherwise become_primary() listens for a later launch asking to close.
+    """
+
+    def __init__(self) -> None:
+        self._name = "hardware-bar"
+        self._server: QLocalServer | None = None
+
+    def signal_existing(self) -> bool:
+        log.info("signal_existing: trying to connect to %s", self._name)
+        sock = QLocalSocket()
+        sock.connectToServer(self._name)
+        if not sock.waitForConnected(500):
+            log.info("  no existing instance (errno=%s, err=%s)",
+                     sock.error(), sock.errorString())
+            return False
+        log.info("  existing instance found — sending 'close'")
+        sock.write(b"close")
+        sock.flush()
+        sock.waitForBytesWritten(500)
+        sock.disconnectFromServer()
+        sock.waitForDisconnected(500)
+        return True
+
+    def become_primary(self, on_close: Callable[[], None]) -> None:
+        log.info("become_primary: claiming %s", self._name)
+        removed = QLocalServer.removeServer(self._name)
+        log.info("  removeServer returned %s", removed)
+        self._server = QLocalServer()
+        if not self._server.listen(self._name):
+            log.error("  listen FAILED: %s", self._server.errorString())
+            self._server = None
+            return
+        log.info("  now listening for close requests")
+
+        def _on_new_connection() -> None:
+            while self._server is not None and self._server.hasPendingConnections():
+                conn = self._server.nextPendingConnection()
+                conn.waitForReadyRead(500)
+                msg = bytes(conn.readAll()).decode("utf-8", "ignore")
+                log.info("received message: %r", msg)
+                conn.disconnectFromServer()
+                if "close" in msg:
+                    log.info("  -> tearing down server + closing bar + quitting app")
+                    try:
+                        self._server.close()
+                    except Exception as e:
+                        log.warning("  server.close() raised: %s", e)
+                    QLocalServer.removeServer(self._name)
+                    self._server = None
+                    on_close()
+                    app = QApplication.instance()
+                    if app is not None:
+                        app.quit()
+
+        self._server.newConnection.connect(_on_new_connection)
+
+
 def main() -> int:
+    _setup_logging()
+    log.info("=" * 60)
+    log.info("launch argv=%s  log=%s", sys.argv[1:], LOG_PATH)
+
     app = QApplication(sys.argv)
+
+    single = SingleInstance()
+    if single.signal_existing():
+        log.info("signaled existing bar — exiting")
+        return 0
+
+    log.info("no existing bar — becoming primary")
     bar = Bar()
+    single.become_primary(bar.close)
     bar.show()
-    return app.exec()
+    log.info("entering Qt event loop")
+    rc = app.exec()
+    log.info("event loop exited with rc=%s", rc)
+    return rc
 
 
 if __name__ == "__main__":
