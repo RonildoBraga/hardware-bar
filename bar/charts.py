@@ -182,7 +182,9 @@ METRICS: dict[str, MetricSpec] = {
     "cpu": MetricSpec(
         title="CPU utility",
         y_label="%",
-        y_range=(0, 100),
+        # 0-200: the Windows "Processor Utility" counter includes frequency
+        # scaling, so a boosted 12700F legitimately reads 120-180% under load.
+        y_range=(0, 200),
         series=[("CPU", "#4ea1ff", lambda s: s.cpu_pct)],
         header_fn=_h_cpu,
     ),
@@ -210,7 +212,8 @@ METRICS: dict[str, MetricSpec] = {
     "cpu-gpu": MetricSpec(
         title="CPU utility + GPU load",
         y_label="%",
-        y_range=(0, 100),
+        # CPU can exceed 100% via Turbo (see `cpu` entry); GPU is 0-100 via NVML.
+        y_range=(0, 200),
         series=[
             ("CPU", "#4ea1ff", lambda s: s.cpu_pct),
             ("GPU", "#57d787", lambda s: s.gpu_pct),
