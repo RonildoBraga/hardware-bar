@@ -229,12 +229,10 @@ class EnergyChart(QWidget):
         self.shared = SharedState()
         self._drag_offset: QPoint | None = None
 
-        # We build the per-device curve/fill items lazily once the poller
-        # reports the device set — before that we don't know who's there.
+        # We build the per-device curves lazily once the poller reports the
+        # device set — before that we don't know who's there.
         self._built = False
-        self._upper_curves: dict[str, pg.PlotDataItem] = {}
-        self._lower_curves: dict[str, pg.PlotDataItem] = {}
-        self._fills:        dict[str, pg.FillBetweenItem] = {}
+        self._curves: dict[str, pg.PlotDataItem] = {}
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -298,37 +296,17 @@ class EnergyChart(QWidget):
 
     # -- curve construction (once the device set is known) --
     def _build_curves(self, devices: dict[str, Device], order: list[str]) -> None:
-        # Remove any prior items in case we're rebuilding.
-        for uuid in list(self._fills):
-            self.plot.removeItem(self._fills[uuid])
-        for uuid in list(self._upper_curves):
-            self.plot.removeItem(self._upper_curves[uuid])
-        self._upper_curves.clear()
-        self._lower_curves.clear()
-        self._fills.clear()
+        for uuid in list(self._curves):
+            self.plot.removeItem(self._curves[uuid])
+        self._curves.clear()
         try:
             self.legend.clear()
         except Exception:
             pass
-
-        zeros = [0.0] * WINDOW_N_SAMPLES
         for uuid in order:
             dev = devices[uuid]
-            color = QColor(dev.color)
-            pen   = pg.mkPen(color=color, width=1.2)
-            brush = QColor(color)
-            brush.setAlpha(160)
-
-            upper = self.plot.plot(self._x, zeros, pen=pen, name=dev.name)
-            lower = pg.PlotDataItem(self._x, zeros, pen=pg.mkPen(color=color, width=0))
-            # lower is only referenced by FillBetweenItem; do NOT addItem it
-            # (would create a redundant line and mess with legend).
-            fill = pg.FillBetweenItem(upper, lower, brush=pg.mkBrush(brush))
-            self.plot.addItem(fill)
-
-            self._upper_curves[uuid] = upper
-            self._lower_curves[uuid] = lower
-            self._fills[uuid]        = fill
+            pen = pg.mkPen(color=QColor(dev.color), width=2)
+            self._curves[uuid] = self.plot.plot(name=dev.name, pen=pen)
         self._built = True
 
     # -- per-tick update --
@@ -350,19 +328,16 @@ class EnergyChart(QWidget):
         if not self._built:
             self._build_curves(devices, order)
 
-        # Compute cumulative stacked values in fixed order.
-        running = [0.0] * WINDOW_N_SAMPLES
+        # One line per device; skip None samples (same pattern as bar.charts).
         for uuid in order:
-            if uuid not in self._upper_curves:
+            if uuid not in self._curves:
                 continue
-            dev = devices[uuid]
-            lower_y = running[:]
-            upper_y = running[:]
-            for i, v in enumerate(dev.history):
-                upper_y[i] = (running[i] or 0.0) + (v or 0.0)
-            running = upper_y[:]
-            self._upper_curves[uuid].setData(self._x, upper_y)
-            self._lower_curves[uuid].setData(self._x, lower_y)
+            xs, ys = [], []
+            for x, v in zip(self._x, devices[uuid].history):
+                if v is not None:
+                    xs.append(x)
+                    ys.append(float(v))
+            self._curves[uuid].setData(xs, ys)
 
         # Header: total + top-3 current consumers.
         totals: list[tuple[str, float, str]] = []
