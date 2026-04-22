@@ -78,6 +78,9 @@ class MetricSpec:
     y_range: tuple[float, float] | None  # None = auto
     # series: list of (label, color, extractor). Extractor takes Sample and returns a value (or None).
     series: list[tuple[str, str, Callable[[Sample], float | None]]]
+    # Optional live header line shown in place of the static title. Receives
+    # the current Sample, returns an HTML fragment rendered by the title label.
+    header_fn: Callable[[Sample], str] | None = None
 
 
 def _disk_activity_series(label_prefix: str, idx: int, color: str):
@@ -86,6 +89,85 @@ def _disk_activity_series(label_prefix: str, idx: int, color: str):
             return None
         return s.disks[idx].activity_pct
     return (label_prefix, color, extract)
+
+
+# -------- header formatters --------------------------------------------
+
+def _fmt(val: float | None, unit: str, digits: int = 0) -> str:
+    if val is None:
+        return f"--{unit}"
+    return f"{val:.{digits}f}{unit}"
+
+
+def _colored(text: str, color: str) -> str:
+    return f'<span style="color:{color}">{text}</span>'
+
+
+def _h_cpu(s: Sample) -> str:
+    return "CPU " + _colored(_fmt(s.cpu_pct, "%"), "#4ea1ff")
+
+
+def _h_cpu_temp(s: Sample) -> str:
+    return "CPU " + _colored(_fmt(s.cpu_temp_c, "°C"), "#ff6b6b")
+
+
+def _h_gpu(s: Sample) -> str:
+    return "GPU " + _colored(_fmt(s.gpu_pct, "%"), "#57d787")
+
+
+def _h_gpu_temp(s: Sample) -> str:
+    return "GPU " + _colored(_fmt(s.gpu_temp_c, "°C"), "#ff9f43")
+
+
+def _h_cpu_gpu(s: Sample) -> str:
+    return (_colored("CPU " + _fmt(s.cpu_pct, "%"), "#4ea1ff")
+            + "&nbsp;&nbsp;&nbsp;"
+            + _colored("GPU " + _fmt(s.gpu_pct, "%"), "#57d787"))
+
+
+def _h_ram(s: Sample) -> str:
+    if s.ram_used_gb is None or s.ram_total_gb is None:
+        return "RAM --"
+    pct = 100 * s.ram_used_gb / s.ram_total_gb if s.ram_total_gb else 0
+    text = f"{s.ram_used_gb:.1f}/{s.ram_total_gb:.0f}G ({pct:.0f}%)"
+    return "RAM " + _colored(text, "#c780ff")
+
+
+_DISK_COLORS = ["#4ea1ff", "#57d787", "#ff9f43", "#c780ff"]
+
+
+def _h_disk(s: Sample) -> str:
+    parts = []
+    for i, r in enumerate(s.disks or []):
+        color = _DISK_COLORS[i % len(_DISK_COLORS)]
+        parts.append(_colored(f"{r.label} {_fmt(r.activity_pct, '%')}", color))
+    return "&nbsp;&nbsp;".join(parts) or "no disks"
+
+
+def _h_disk_temps(s: Sample) -> str:
+    parts = []
+    for i, r in enumerate(s.disks or []):
+        color = _DISK_COLORS[i % len(_DISK_COLORS)]
+        parts.append(_colored(f"{r.label} {_fmt(r.temp_c, '°C')}", color))
+    return "&nbsp;&nbsp;".join(parts) or "no disks"
+
+
+def _h_net(s: Sample) -> str:
+    down = _colored(f"↓ {_fmt(s.net_down_mbps, 'M/s', 1)}", "#4ea1ff")
+    up   = _colored(f"↑ {_fmt(s.net_up_mbps,  'M/s', 1)}", "#ff9f43")
+    return f"{down}&nbsp;&nbsp;&nbsp;{up}"
+
+
+def _h_temps(s: Sample) -> str:
+    parts = [
+        _colored(f"CPU {_fmt(s.cpu_temp_c, '°C')}", "#ff6b6b"),
+        _colored(f"GPU {_fmt(s.gpu_temp_c, '°C')}", "#ff9f43"),
+    ]
+    extra_colors = ["#4ea1ff", "#57d787", "#a0a0a0", "#c780ff"]
+    for i, r in enumerate(s.disks or []):
+        parts.append(_colored(f"{r.label} {_fmt(r.temp_c, '°C')}",
+                              extra_colors[i % len(extra_colors)]))
+    return "&nbsp;".join(parts)
 
 
 def _disk_temp_series(label_prefix: str, idx: int, color: str):
@@ -102,24 +184,28 @@ METRICS: dict[str, MetricSpec] = {
         y_label="%",
         y_range=(0, 100),
         series=[("CPU", "#4ea1ff", lambda s: s.cpu_pct)],
+        header_fn=_h_cpu,
     ),
     "cpu-temp": MetricSpec(
         title="CPU temperature",
         y_label="°C",
         y_range=(20, 100),
         series=[("CPU", "#ff6b6b", lambda s: s.cpu_temp_c)],
+        header_fn=_h_cpu_temp,
     ),
     "gpu": MetricSpec(
         title="GPU load",
         y_label="%",
         y_range=(0, 100),
         series=[("GPU", "#57d787", lambda s: s.gpu_pct)],
+        header_fn=_h_gpu,
     ),
     "gpu-temp": MetricSpec(
         title="GPU temperature",
         y_label="°C",
         y_range=(20, 100),
         series=[("GPU", "#ff9f43", lambda s: s.gpu_temp_c)],
+        header_fn=_h_gpu_temp,
     ),
     "cpu-gpu": MetricSpec(
         title="CPU utility + GPU load",
@@ -129,12 +215,14 @@ METRICS: dict[str, MetricSpec] = {
             ("CPU", "#4ea1ff", lambda s: s.cpu_pct),
             ("GPU", "#57d787", lambda s: s.gpu_pct),
         ],
+        header_fn=_h_cpu_gpu,
     ),
     "ram": MetricSpec(
         title="RAM used",
         y_label="GB",
         y_range=(0, 64),
         series=[("RAM", "#c780ff", lambda s: s.ram_used_gb)],
+        header_fn=_h_ram,
     ),
     "disk": MetricSpec(
         title="Disk activity",
@@ -146,6 +234,7 @@ METRICS: dict[str, MetricSpec] = {
             _disk_activity_series("E", 2, "#ff9f43"),
             _disk_activity_series("F", 3, "#c780ff"),
         ],
+        header_fn=_h_disk,
     ),
     "disk-temps": MetricSpec(
         title="Disk temperatures",
@@ -157,6 +246,7 @@ METRICS: dict[str, MetricSpec] = {
             _disk_temp_series("E", 2, "#ff9f43"),
             _disk_temp_series("F", 3, "#c780ff"),
         ],
+        header_fn=_h_disk_temps,
     ),
     "net": MetricSpec(
         title="Network",
@@ -166,6 +256,7 @@ METRICS: dict[str, MetricSpec] = {
             ("down", "#4ea1ff", lambda s: s.net_down_mbps),
             ("up",   "#ff9f43", lambda s: s.net_up_mbps),
         ],
+        header_fn=_h_net,
     ),
     "temps": MetricSpec(
         title="All temperatures",
@@ -179,6 +270,7 @@ METRICS: dict[str, MetricSpec] = {
             _disk_temp_series("E",    2, "#a0a0a0"),
             _disk_temp_series("F",    3, "#c780ff"),
         ],
+        header_fn=_h_temps,
     ),
 }
 
@@ -198,8 +290,9 @@ class ChartWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.resize(WINDOW_W, WINDOW_H)
 
-        # Title label (top bar)
+        # Title label (top bar). Doubles as live header when spec.header_fn is set.
         self.title_label = QLabel(spec.title)
+        self.title_label.setTextFormat(Qt.TextFormat.RichText)
         self.title_label.setFont(QFont("Cascadia Mono", 9))
         self.title_label.setStyleSheet(
             f"color: {TEXT}; padding: 4px 8px 0 10px; background: transparent;"
@@ -269,6 +362,11 @@ class ChartWindow(QWidget):
                     xs.append(x)
                     ys.append(y)
             self._curves[i].setData(xs, ys)
+        if self._spec.header_fn is not None:
+            try:
+                self.title_label.setText(self._spec.header_fn(sample))
+            except Exception as e:
+                log.debug("header_fn failed: %s", e)
 
     # -- drag --
     def mousePressEvent(self, event) -> None:
