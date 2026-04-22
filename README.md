@@ -236,6 +236,28 @@ Subsequent calls ~300-500ms (cached token, only MQTT connect). If this
 becomes uncomfortable for rapid buttons, we can add a daemon like
 `brightness/daemon.py` that keeps MQTT open; start without one.
 
+### Live energy chart
+
+`python -m meross.chart` opens a stacked-area window showing per-plug
+power draw over the last 20 minutes. Each device is a coloured band;
+the top edge of the stack is the total draw; a text header shows
+live TOTAL and top-3 consumers.
+
+```
+File: C:\Users\ronildo\Developer\hardware-bar\.venv\Scripts\pythonw.exe
+Args: -m meross.chart
+Working dir: C:\Users\ronildo\Developer\hardware-bar
+```
+
+Architecture: background asyncio thread keeps the Meross MQTT
+connection open and polls all `ElectricityMixin` devices in parallel
+every 10 s (`POLL_INTERVAL_S`). Qt timer at 1 Hz repaints from the
+shared buffer. Each sample is also appended to `.charts/meross-energy
+.csv` for later analysis (ISO timestamp, device name, watts).
+
+Launching it while already open closes the existing window, same
+single-instance toggle pattern as the other charts.
+
 ## Live charts
 
 Per-metric live history plots (`bar.charts`), toggled from a Loupedeck key.
@@ -286,7 +308,8 @@ hardware-bar/
 │
 ├── meross/                                    Meross smart-plug control
 │   ├── __main__.py                            `python -m meross`
-│   └── core.py                                meross_iot async wrapped sync
+│   ├── core.py                                meross_iot async wrapped sync
+│   └── chart.py                               `python -m meross.chart` — stacked-area energy chart
 │
 ├── scripts/
 │   ├── launchers/                             manual / Loupedeck launchers
