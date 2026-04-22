@@ -180,6 +180,62 @@ Get-Content $env:TEMP\hardware-bar-audio.log -Tail 20 -Wait
 The bar's `VOL` field shows `VOL 88%` (or `VOL MUTE` in red when muted),
 and `OUT` shows the current device name with the driver suffix stripped.
 
+## Smart plugs (Meross)
+
+Control Meross Wi-Fi smart plugs (and anything else in your Meross account)
+via the `meross_iot` Python library. Authenticates to the Meross cloud
+once with your account credentials, caches the resulting token, and talks
+to the plugs over Meross's MQTT broker. Works for this ExpressVPN-router
+network where multicast/LAN-local discovery is suppressed — control traffic
+is cloud-routed, not LAN-broadcast.
+
+### One-time credentials
+
+Create `meross_creds.local.json` at the project root (gitignored):
+
+```json
+{
+  "email": "you@example.com",
+  "password": "your-meross-app-password",
+  "api_base_url": null
+}
+```
+
+Use the same email + password you log in to the Meross app with.
+`api_base_url` can stay `null` — the code defaults to the Asia-Pacific
+endpoint for Australia; Meross auto-redirects regardless.
+
+On first run the code logs in via HTTPS, saves the resulting token to
+`meross_token.local.json` (also gitignored), and re-uses it on every
+subsequent call so the slow login only happens once.
+
+### Loupedeck wiring
+
+```
+File: C:\Users\ronildo\Developer\hardware-bar\.venv\Scripts\pythonw.exe
+Args: C:\Users\ronildo\Developer\hardware-bar\meross\core.py --toggle Dehumidifier
+```
+
+Names are matched case-insensitively against the names shown in the Meross
+app (not the router dashboard). Use `--list` to confirm the exact strings.
+
+### Handy commands
+
+```powershell
+.\.venv\Scripts\python.exe -m meross --list                 # all plugs, with on/off + power
+.\.venv\Scripts\python.exe -m meross --status Dehumidifier
+.\.venv\Scripts\python.exe -m meross --on     Dehumidifier
+.\.venv\Scripts\python.exe -m meross --off    Dehumidifier
+.\.venv\Scripts\python.exe -m meross --toggle Dehumidifier
+.\scripts\launchers\meross-debug.bat --list                 # visible console
+Get-Content $env:TEMP\hardware-bar-meross.log -Tail 20 -Wait
+```
+
+Latency budget: first cold call ~1-2s (HTTP login + MQTT connect).
+Subsequent calls ~300-500ms (cached token, only MQTT connect). If this
+becomes uncomfortable for rapid buttons, we can add a daemon like
+`brightness/daemon.py` that keeps MQTT open; start without one.
+
 ## Live charts
 
 Per-metric live history plots (`bar.charts`), toggled from a Loupedeck key.
@@ -224,6 +280,14 @@ hardware-bar/
 │   ├── __main__.py                            `python -m audio`
 │   └── core.py                                pycaw wrappers + IPolicyConfig switch
 │
+├── discovery/                                 LAN reconnaissance (mDNS + SSDP)
+│   ├── __main__.py                            `python -m discovery`
+│   └── core.py                                zeroconf probe + raw SSDP socket
+│
+├── meross/                                    Meross smart-plug control
+│   ├── __main__.py                            `python -m meross`
+│   └── core.py                                meross_iot async wrapped sync
+│
 ├── scripts/
 │   ├── launchers/                             manual / Loupedeck launchers
 │   │   ├── run.bat                            start the bar silently
@@ -232,7 +296,8 @@ hardware-bar/
 │   │   ├── brightness-daemon.bat              silent daemon launch (manual)
 │   │   ├── brightness-daemon-debug.bat        visible daemon launch (debug)
 │   │   ├── nightlight-debug.bat               visible-console nightlight CLI
-│   │   └── audio-debug.bat                    visible-console audio CLI
+│   │   ├── audio-debug.bat                    visible-console audio CLI
+│   │   └── meross-debug.bat                   visible-console meross CLI
 │   └── install/                               one-time installers
 │       ├── register-lhm-task.bat / .ps1       admin ONLOGON task for LHM
 │       ├── install-bar-autostart.bat / .ps1   user Startup shortcut for the bar

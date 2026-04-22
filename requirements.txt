@@ -5,3 +5,5 @@ requests>=2.31
 pyqtgraph>=0.13
 monitorcontrol>=4.2
 pycaw>=20240210
+zeroconf>=0.130
+meross_iot>=0.4

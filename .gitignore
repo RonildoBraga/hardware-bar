@@ -4,6 +4,8 @@ __pycache__/
 vendor/LibreHardwareMonitor/
 config.local.json
 audio_filter.local.json
+meross_creds.local.json
+meross_token.local.json
 .charts/
 lhm-sample.json
 mysetup.txt
