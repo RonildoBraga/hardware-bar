@@ -39,7 +39,13 @@ from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QVBoxLayout, QWidget
 
 from meross_iot.controller.mixins.electricity import ElectricityMixin
 
-from .core import _connect
+# Allow direct-file invocation (e.g. `pythonw.exe C:\...\meross\chart.py` from
+# a Loupedeck binding without a working-directory field) — put the project
+# root on sys.path so the `meross` package is importable.
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from meross.core import _connect
 
 LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-meross-chart.log"
 log = logging.getLogger("meross.chart")
