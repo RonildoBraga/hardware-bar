@@ -1,6 +1,9 @@
 @echo off
-REM Right-click this file and choose "Run as administrator"
-REM to register LibreHardwareMonitor as an auto-starting admin task.
+REM Right-click this file and choose "Run as administrator" to register
+REM LibreHardwareMonitor as an on-demand admin task. After this runs once,
+REM the bar can trigger LHM elevated without a UAC prompt via
+REM `schtasks /Run /TN LibreHardwareMonitor`. No ONLOGON trigger — LHM only
+REM starts when the bar/charts actually need it.
 
 net session >nul 2>&1
 if %errorLevel% neq 0 (

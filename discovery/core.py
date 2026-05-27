@@ -24,31 +24,18 @@ import json
 import logging
 import socket
 import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from zeroconf import IPVersion, ServiceBrowser, ServiceListener, Zeroconf
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-discovery.log"
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import setup_logging
+
 log = logging.getLogger("discovery")
-
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass
 
 
 @dataclass
@@ -245,10 +232,9 @@ def _print_human(devices: list[Device]) -> None:
 
 
 def main() -> int:
-    _setup_logging()
+    _, log_path = setup_logging("discovery", "hardware-bar-discovery.log")
     args = sys.argv[1:]
-    log.info("=" * 50)
-    log.info("launch argv=%s log=%s", args, LOG_PATH)
+    log.info("launch argv=%s log=%s", args, log_path)
 
     timeout = 3.0
     as_json = False

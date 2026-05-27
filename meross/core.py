@@ -26,7 +26,6 @@ import asyncio
 import json
 import logging
 import sys
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +34,11 @@ from meross_iot.http_api import MerossHttpClient
 from meross_iot.manager import MerossManager
 from meross_iot.model.credentials import MerossCloudCreds
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-meross.log"
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import setup_logging
+
 log = logging.getLogger("meross")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -48,22 +51,10 @@ TOKEN_FILE   = PROJECT_ROOT / "meross_token.local.json"
 DEFAULT_API_BASE = "https://iotx-ap.meross.com"
 
 
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass
-    # Quiet meross_iot's own chatty loggers and stop them bubbling up to any
-    # root handler the library installed via logging.basicConfig() elsewhere.
+def _quiet_meross_loggers() -> None:
+    """Stop meross_iot/paho/asyncio/aiohttp from drowning the log file —
+    they all use root-attached handlers via logging.basicConfig() unless told
+    otherwise. Call after setup_logging()."""
     log.propagate = False
     for noisy in ("meross_iot", "paho", "asyncio", "aiohttp"):
         lg = logging.getLogger(noisy)
@@ -223,10 +214,10 @@ async def _do(action: str, name: Optional[str]) -> int:
 # -------- CLI ----------------------------------------------------------
 
 def main() -> int:
-    _setup_logging()
+    _, log_path = setup_logging("meross", "hardware-bar-meross.log")
+    _quiet_meross_loggers()
     args = sys.argv[1:]
-    log.info("=" * 50)
-    log.info("launch argv=%s log=%s", args, LOG_PATH)
+    log.info("launch argv=%s log=%s", args, log_path)
 
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)

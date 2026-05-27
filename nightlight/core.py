@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import logging
 import sys
-import tempfile
 import winreg
 from pathlib import Path
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-nightlight.log"
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import setup_logging
+
 log = logging.getLogger("nightlight")
 
 REG_SUBKEY = (
@@ -53,22 +56,6 @@ REG_VALUE = "Data"
 SENTINEL      = bytes([0x43, 0x42, 0x01, 0x00])  # 'CB\x01\x00' — appears twice
 ENABLE_MARKER = bytes([0x10, 0x00])              # after INNER sentinel => ON
 TIMESTAMP_RANGE = range(10, 15)                  # varint bytes to bump
-
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass  # pythonw has no stderr
 
 
 # -------- registry blob manipulation ------------------------------------
@@ -185,10 +172,9 @@ def toggle() -> bool | None:
 # -------- CLI -----------------------------------------------------------
 
 def main() -> int:
-    _setup_logging()
+    _, log_path = setup_logging("nightlight", "hardware-bar-nightlight.log")
     args = sys.argv[1:]
-    log.info("=" * 50)
-    log.info("launch argv=%s log=%s", args, LOG_PATH)
+    log.info("launch argv=%s log=%s", args, log_path)
 
     if not args or args[0] in ("-h", "--help", "help"):
         print(__doc__)

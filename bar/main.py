@@ -9,15 +9,13 @@ Data sources:
 
 from __future__ import annotations
 
-import json
 import logging
 import socket
+import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import ctypes
 from ctypes import wintypes
@@ -36,32 +34,21 @@ import audio
 import nightlight
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QAction, QFont, QFontDatabase
-from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QWidget, QHBoxLayout
+
+from _common import (
+    SingleInstance, load_window_pos, publish_sample, save_window_pos, setup_logging,
+)
 
 LHM_URL = "http://localhost:8085/data.json"
 LHM_TIMEOUT_S = 0.5
+LHM_TASK_NAME = "LibreHardwareMonitor"
 REFRESH_MS = 1000
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.local.json"
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar.log"
 
+# Handlers attached lazily in main() so `from bar import Sample/Poller`
+# from bar.charts doesn't create a log file as a side-effect.
 log = logging.getLogger("bar")
-
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass  # pythonw has no stderr
 
 BRIGHTNESS_HOST = "127.0.0.1"
 BRIGHTNESS_PORT = 48736
@@ -149,10 +136,15 @@ class Sample:
 class CpuUtility:
     """Reads '\\Processor Information(_Total)\\% Processor Utility' via Windows PDH.
 
-    This is the same counter Task Manager shows for CPU on Windows 8+ — it
-    accounts for frequency scaling, unlike psutil.cpu_percent() which maps to
-    the older '% Processor Time' counter (which is just "time not idle" and
-    reads as near-zero on modern CPUs parked at low clocks).
+    Same underlying counter Task Manager uses on Windows 8+, but reported as a
+    percent of the *base* frequency — so on Turbo it legitimately exceeds 100%
+    (a 12700F at 4.8 GHz against a 2.1 GHz P-core base reads ~180% under load).
+    Task Manager caps display at 100% and shows the turbo factor as "Speed";
+    we keep the raw value so `bar.charts` can show Turbo, and cap the bar's
+    own display in `render()` (the GHz field carries the turbo info there).
+
+    Chosen over psutil.cpu_percent() because psutil maps to '% Processor Time'
+    (time-not-idle), which under-represents work on modern parked-core CPUs.
     """
 
     _PDH_FMT_DOUBLE = 0x00000200
@@ -211,6 +203,10 @@ class Poller:
         self._last_net_t = time.monotonic()
 
         self._cpu_utility = CpuUtility()
+
+        # LHM auto-spawn: set once per Poller lifetime on first unreachable
+        # LHM, so we don't spam schtasks every second.
+        self._lhm_spawn_tried = False
 
     def sample(self) -> Sample:
         s = Sample()
@@ -293,24 +289,52 @@ class Poller:
         except Exception:
             pass
 
-        # lhm (cpu package temp, nvme ssd temp)
+        # lhm (cpu package temp+power, gpu/case fans, per-disk temp+activity).
+        # One outer tree-walk in `_parse_lhm`, plus a small sub-walk per disk
+        # device — replaces the previous 5+ full walks per tick.
         try:
             r = requests.get(LHM_URL, timeout=LHM_TIMEOUT_S)
             r.raise_for_status()
-            tree = r.json()
-            s.cpu_temp_c = _find_cpu_package_temp(tree)
-            s.cpu_power_w = _find_cpu_package_power(tree)
-            s.gpu_fan_rpm = _find_gpu_fan_avg(tree)
-            s.case_fans = _find_case_fans(tree, CASE_FAN_NUMBERS)
+            parsed = _parse_lhm(r.json())
+            s.cpu_temp_c = parsed.cpu_temp_c
+            s.cpu_power_w = parsed.cpu_power_w
+            s.gpu_fan_rpm = parsed.gpu_fan_rpm
+            s.case_fans = [(n, parsed.motherboard_fans.get(n)) for n in CASE_FAN_NUMBERS]
             if AIO_FAN_NUMBER is not None:
-                aio_list = _find_case_fans(tree, [AIO_FAN_NUMBER])
-                s.aio_rpm = aio_list[0][1] if aio_list else None
+                s.aio_rpm = parsed.motherboard_fans.get(AIO_FAN_NUMBER)
             if s.disks:
-                _attach_disk_sensors(tree, s.disks)
+                _attach_disk_readings(s.disks, parsed)
         except (requests.RequestException, ValueError):
-            pass
+            self._maybe_start_lhm()
 
         return s
+
+    def _maybe_start_lhm(self) -> None:
+        """Fire the on-demand LHM scheduled task once per Poller lifetime.
+
+        The task is registered (via scripts/install/register-lhm-task.bat)
+        with /RL HIGHEST so `schtasks /Run` launches LHM elevated without a
+        UAC prompt. If the task isn't registered we log once and stop
+        retrying — bar/charts still function, those LHM-fed fields just
+        stay `--` until the user runs the installer.
+        """
+        if self._lhm_spawn_tried:
+            return
+        self._lhm_spawn_tried = True
+        try:
+            result = subprocess.run(
+                ["schtasks.exe", "/Run", "/TN", LHM_TASK_NAME],
+                capture_output=True, text=True, timeout=2.0,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode == 0:
+                log.info("LHM unreachable; triggered scheduled task %s", LHM_TASK_NAME)
+            else:
+                log.info("LHM unreachable; schtasks /Run %s failed rc=%d stderr=%s",
+                         LHM_TASK_NAME, result.returncode,
+                         (result.stderr or "").strip())
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.info("LHM unreachable; schtasks /Run raised: %s", e)
 
 
 # -------- brightness daemon ---------------------------------------------
@@ -375,136 +399,130 @@ def _parse_lhm_value(v: str | None) -> float | None:
         return None
 
 
-def _find_cpu_package_temp(tree: dict) -> float | None:
-    """Return the 'CPU Package' temperature in °C. Falls back to 'Core Average'
-    if Package isn't available. Only matches nodes of Type=Temperature —
-    otherwise 'Power/CPU Package' (in watts) would be returned as the temp."""
-    core_avg = None
+@dataclass
+class _LhmReadings:
+    cpu_temp_c: float | None = None
+    cpu_power_w: float | None = None
+    gpu_fan_rpm: float | None = None  # averaged across GPU fans
+    motherboard_fans: dict[int, float] = field(default_factory=dict)  # {fan_number: rpm}
+    # Disk readings keyed by (model_string, occurrence_index) — same shape DISKS uses.
+    disks: dict[tuple[str, int], tuple[float | None, float | None]] = field(default_factory=dict)
+
+
+def _parse_lhm(tree: dict) -> _LhmReadings:
+    """Single outer walk extracting every LHM value the bar/charts use.
+
+    Disk sensors are intrinsically scoped to a device's subtree (so the same
+    'Composite Temperature' label can appear in multiple NVMe subtrees), so
+    each disk device kicks off a small sub-walk over its own subtree. That's
+    still one outer walk + N tiny sub-walks instead of the previous 5+ full
+    walks per tick.
+    """
+    r = _LhmReadings()
+    cpu_core_avg: float | None = None       # fallback for cpu_temp_c
+    cpu_power_fallback: float | None = None  # weaker fallback for cpu_power_w
+    gpu_fan_rpms: list[float] = []
+    model_occurrence: dict[str, int] = {}
+
     for node in _walk(tree):
-        if (node.get("Type") or "").lower() != "temperature":
+        text = (node.get("Text") or "").strip()
+        text_lower = text.lower()
+        ntype = (node.get("Type") or "").lower()
+
+        # Disk device subtree — text contains a DISKS model name and the
+        # subtree exposes temp/activity sensors. Sub-walked here so that
+        # composite/plain temperature lookups don't bleed across devices.
+        for spec in DISKS:
+            if spec.lhm_model in text:
+                temp, activity = _disk_subtree_sensors(node)
+                if temp is None and activity is None:
+                    continue  # text matched, but it's not actually a device node
+                idx = model_occurrence.get(spec.lhm_model, 0)
+                r.disks[(spec.lhm_model, idx)] = (temp, activity)
+                model_occurrence[spec.lhm_model] = idx + 1
+                break
+
+        val = _parse_lhm_value(node.get("Value"))
+        if val is None:
             continue
+
+        if ntype == "temperature":
+            if text_lower == "cpu package" and r.cpu_temp_c is None:
+                r.cpu_temp_c = val
+            elif text_lower == "core average":
+                cpu_core_avg = val  # remembered as fallback if no Package node
+
+        elif ntype == "power":
+            # "CPU Package" / "Package" — preferred. "CPU Cores [...] Package"
+            # variants (some LHM builds) also count. Parens are explicit on the
+            # last clause because `or X and Y` parses surprisingly otherwise.
+            is_cpu_pkg_pow = (
+                "cpu package" in text_lower
+                or text_lower == "package"
+                or ("cpu cores" in text_lower and "package" in text_lower)
+            )
+            if is_cpu_pkg_pow:
+                if r.cpu_power_w is None:
+                    r.cpu_power_w = val
+            elif "package" in text_lower and cpu_power_fallback is None:
+                cpu_power_fallback = val
+
+        elif ntype == "fan":
+            if text_lower.startswith("gpu fan"):
+                gpu_fan_rpms.append(val)
+            elif text_lower.startswith("fan #"):
+                try:
+                    n = int(text.split("#", 1)[1])
+                    r.motherboard_fans[n] = val
+                except (ValueError, IndexError):
+                    pass
+
+    if r.cpu_temp_c is None:
+        r.cpu_temp_c = cpu_core_avg
+    if r.cpu_power_w is None:
+        r.cpu_power_w = cpu_power_fallback
+    if gpu_fan_rpms:
+        r.gpu_fan_rpm = sum(gpu_fan_rpms) / len(gpu_fan_rpms)
+    return r
+
+
+def _disk_subtree_sensors(device_node: dict) -> tuple[float | None, float | None]:
+    """Return (temp_c, activity_pct) for a single LHM storage-device subtree.
+
+    Temp prefers 'Composite Temperature' (NVMe), falls back to plain
+    'Temperature' (SATA). Activity is the 'Total Activity' Load %.
+    Walks the subtree once.
+    """
+    composite: float | None = None
+    plain: float | None = None
+    activity: float | None = None
+    for node in _walk(device_node):
+        ntype = (node.get("Type") or "").lower()
         text = (node.get("Text") or "").strip().lower()
         val = _parse_lhm_value(node.get("Value"))
         if val is None:
             continue
-        if text == "cpu package":
-            return val
-        if text == "core average":
-            core_avg = val
-    return core_avg
+        if ntype == "temperature":
+            if "composite" in text:
+                composite = val
+            elif text == "temperature":
+                plain = val
+        elif ntype == "load" and text == "total activity":
+            activity = val
+    return (composite if composite is not None else plain), activity
 
 
-def _find_cpu_package_power(tree: dict) -> float | None:
-    """Return CPU Package Power in watts."""
-    for node in _walk(tree):
-        text = (node.get("Text") or "").lower()
-        ntype = (node.get("Type") or "").lower()
-        if ntype != "power":
-            continue
-        if "cpu package" in text or text == "package" or "cpu cores" in text and "package" in text:
-            val = _parse_lhm_value(node.get("Value"))
-            if val is not None:
-                return val
-    # fallback: any node whose text contains "package" and type is power
-    for node in _walk(tree):
-        text = (node.get("Text") or "").lower()
-        ntype = (node.get("Type") or "").lower()
-        if ntype == "power" and "package" in text:
-            return _parse_lhm_value(node.get("Value"))
-    return None
-
-
-def _find_gpu_fan_avg(tree: dict) -> float | None:
-    """Return the average RPM across all GPU fans (e.g. 'GPU Fan 1', 'GPU Fan 2')."""
-    rpms: list[float] = []
-    for node in _walk(tree):
-        if (node.get("Type") or "").lower() != "fan":
-            continue
-        text = (node.get("Text") or "").lower()
-        if text.startswith("gpu fan"):
-            val = _parse_lhm_value(node.get("Value"))
-            if val is not None:
-                rpms.append(val)
-    return sum(rpms) / len(rpms) if rpms else None
-
-
-def _find_case_fans(tree: dict, fan_numbers: list[int]) -> list[tuple[int, float | None]]:
-    """Return [(fan_number, rpm)] for the given motherboard Fan #N sensors."""
-    by_number: dict[int, float] = {}
-    for node in _walk(tree):
-        if (node.get("Type") or "").lower() != "fan":
-            continue
-        text = (node.get("Text") or "").strip()
-        # Match "Fan #N" (motherboard fans) — skip "GPU Fan N"
-        if not text.lower().startswith("fan #"):
-            continue
-        try:
-            n = int(text.split("#", 1)[1])
-        except (ValueError, IndexError):
-            continue
-        val = _parse_lhm_value(node.get("Value"))
-        if val is not None:
-            by_number[n] = val
-    return [(n, by_number.get(n)) for n in fan_numbers]
-
-
-def _attach_disk_sensors(tree: dict, disks: list[DiskReading]) -> None:
-    """For each DISKS spec, find its Nth matching LHM device node and pull
-    the primary temperature + 'Total Activity' load % from its subtree."""
-    model_occurrence: dict[str, int] = {}
-    found: dict[tuple[str, int], tuple[float | None, float | None]] = {}
-
-    for node in _walk(tree):
-        text = (node.get("Text") or "").strip()
-        for spec in DISKS:
-            if spec.lhm_model not in text:
-                continue
-            temp = _first_disk_temp(node)
-            activity = _first_disk_activity(node)
-            if temp is None and activity is None:
-                continue  # not actually a storage device node
-            idx = model_occurrence.get(spec.lhm_model, 0)
-            found[(spec.lhm_model, idx)] = (temp, activity)
-            model_occurrence[spec.lhm_model] = idx + 1
-            break
-
+def _attach_disk_readings(disks: list[DiskReading], parsed: _LhmReadings) -> None:
+    """Copy parsed LHM disk values onto the per-drive readings, respecting
+    the (model, lhm_index) pairing in DISKS — needed when multiple drives
+    share a model name (e.g. two BX500s)."""
     for reading in disks:
         spec = next((d for d in DISKS if d.label == reading.label), None)
         if spec is None:
             continue
-        pair = found.get((spec.lhm_model, spec.lhm_index))
+        pair = parsed.disks.get((spec.lhm_model, spec.lhm_index))
         if pair is not None:
             reading.temp_c, reading.activity_pct = pair
-
-
-def _first_disk_temp(device_node: dict) -> float | None:
-    """Primary temperature from a storage-device subtree.
-    Prefers 'Composite Temperature' (NVMe), falls back to plain 'Temperature' (SATA)."""
-    composite: float | None = None
-    plain: float | None = None
-    for node in _walk(device_node):
-        if (node.get("Type") or "").lower() != "temperature":
-            continue
-        text = (node.get("Text") or "").strip().lower()
-        val = _parse_lhm_value(node.get("Value"))
-        if val is None:
-            continue
-        if "composite" in text:
-            composite = val
-        elif text == "temperature":
-            plain = val
-    return composite if composite is not None else plain
-
-
-def _first_disk_activity(device_node: dict) -> float | None:
-    """Return the 'Total Activity' Load % from a storage-device subtree."""
-    for node in _walk(device_node):
-        if (node.get("Type") or "").lower() != "load":
-            continue
-        text = (node.get("Text") or "").strip().lower()
-        if text == "total activity":
-            return _parse_lhm_value(node.get("Value"))
-    return None
 
 
 # -------- ui -------------------------------------------------------------
@@ -543,10 +561,13 @@ def _colored(text: str, color: str) -> str:
 
 def render(s: Sample) -> str:
     """Render the bar as HTML so values can be individually coloured by threshold."""
-    # CPU group
+    # CPU group — cap display at 100% to match Task Manager. The raw counter
+    # can exceed 100% during Turbo (see CpuUtility); the GHz field already
+    # carries that info on the bar, and bar.charts uses the uncapped value.
+    cpu_pct_display = min(s.cpu_pct, 100.0) if s.cpu_pct is not None else None
     cpu_parts = [
         "CPU",
-        _colored(_fmt(s.cpu_pct, "%"), _color_for("cpu_pct", s.cpu_pct)),
+        _colored(_fmt(cpu_pct_display, "%"), _color_for("cpu_pct", cpu_pct_display)),
     ]
     if s.cpu_clock_ghz is not None:
         cpu_parts.append(f"{s.cpu_clock_ghz:.1f}G")
@@ -684,7 +705,6 @@ class Bar(QWidget):
         layout.addWidget(self.label)
 
         self.poller = Poller()
-        psutil.cpu_percent(interval=None)  # prime the rolling window
 
         self._load_position()
 
@@ -694,7 +714,9 @@ class Bar(QWidget):
         self._tick()
 
     def _tick(self) -> None:
-        self.label.setText(render(self.poller.sample()))
+        sample = self.poller.sample()
+        publish_sample(sample)  # so bar.charts can subscribe instead of polling
+        self.label.setText(render(sample))
         self.adjustSize()
 
     # -- drag --
@@ -720,102 +742,26 @@ class Bar(QWidget):
 
     # -- position persistence --
     def _save_position(self) -> None:
-        try:
-            CONFIG_FILE.write_text(json.dumps({"x": self.x(), "y": self.y()}))
-        except OSError:
-            pass
+        save_window_pos(CONFIG_FILE, self)
 
     def _load_position(self) -> None:
-        try:
-            cfg = json.loads(CONFIG_FILE.read_text())
-            self.move(cfg["x"], cfg["y"])
-        except (OSError, ValueError, KeyError):
-            screen = QApplication.primaryScreen().availableGeometry()
-            self.move(screen.right() - 620, screen.top() + 8)
-
-
-class SingleInstance:
-    """One-instance bar toggle via QLocalServer (named pipe on Windows).
-
-    - If a bar is already running, signal_existing() tells it to close and
-      this process exits silently.
-    - Otherwise become_primary() listens for a later launch asking to close.
-    """
-
-    def __init__(self) -> None:
-        self._name = "hardware-bar"
-        self._server: QLocalServer | None = None
-
-    def signal_existing(self) -> bool:
-        log.info("signal_existing: trying to connect to %s", self._name)
-        sock = QLocalSocket()
-        sock.connectToServer(self._name)
-        if not sock.waitForConnected(500):
-            log.info("  no existing instance (errno=%s, err=%s)",
-                     sock.error(), sock.errorString())
-            return False
-        log.info("  existing instance found — sending 'close'")
-        sock.write(b"close")
-        sock.flush()
-        sock.waitForBytesWritten(500)
-        sock.disconnectFromServer()
-        sock.waitForDisconnected(500)
-        return True
-
-    def become_primary(self, on_close: Callable[[], None]) -> None:
-        log.info("become_primary: claiming %s", self._name)
-        removed = QLocalServer.removeServer(self._name)
-        log.info("  removeServer returned %s", removed)
-        self._server = QLocalServer()
-        if not self._server.listen(self._name):
-            log.error("  listen FAILED: %s", self._server.errorString())
-            self._server = None
-            return
-        log.info("  now listening for close requests")
-
-        def _on_new_connection() -> None:
-            while self._server is not None and self._server.hasPendingConnections():
-                conn = self._server.nextPendingConnection()
-                conn.waitForReadyRead(500)
-                msg = bytes(conn.readAll()).decode("utf-8", "ignore")
-                log.info("received message: %r", msg)
-                conn.disconnectFromServer()
-                if "close" in msg:
-                    log.info("  -> tearing down server + closing bar + quitting app")
-                    try:
-                        self._server.close()
-                    except Exception as e:
-                        log.warning("  server.close() raised: %s", e)
-                    QLocalServer.removeServer(self._name)
-                    self._server = None
-                    on_close()
-                    app = QApplication.instance()
-                    if app is not None:
-                        app.quit()
-
-        self._server.newConnection.connect(_on_new_connection)
+        screen = QApplication.primaryScreen().availableGeometry()
+        load_window_pos(CONFIG_FILE, self, (screen.right() - 620, screen.top() + 8))
 
 
 def main() -> int:
-    _setup_logging()
-    log.info("=" * 60)
-    log.info("launch argv=%s  log=%s", sys.argv[1:], LOG_PATH)
+    _, log_path = setup_logging("bar", "hardware-bar.log")
+    log.info("launch argv=%s log=%s", sys.argv[1:], log_path)
 
     app = QApplication(sys.argv)
-
-    single = SingleInstance()
+    single = SingleInstance("hardware-bar", log)
     if single.signal_existing():
-        log.info("signaled existing bar — exiting")
         return 0
 
-    log.info("no existing bar — becoming primary")
     bar = Bar()
     single.become_primary(bar.close)
     bar.show()
-    log.info("entering Qt event loop")
-    rc = app.exec()
-    log.info("event loop exited with rc=%s", rc)
-    return rc
+    return app.exec()
 
 
 if __name__ == "__main__":

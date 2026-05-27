@@ -20,21 +20,18 @@ existing window. Position persists across launches under .charts/.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut
-from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QVBoxLayout, QWidget
 
 from meross_iot.controller.mixins.electricity import ElectricityMixin
@@ -45,9 +42,9 @@ from meross_iot.controller.mixins.electricity import ElectricityMixin
 if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from meross.core import _connect
+from _common import SingleInstance, load_window_pos, save_window_pos, setup_logging
+from meross.core import _connect, _quiet_meross_loggers
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-meross-chart.log"
 log = logging.getLogger("meross.chart")
 
 PROJECT_ROOT    = Path(__file__).resolve().parent.parent
@@ -72,28 +69,6 @@ PALETTE = [
     "#ffcc44", "#4ec0ff", "#87d757", "#ff80bf", "#a0a0a0",
     "#80ffff", "#e0c080",
 ]
-
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass
-    # Quiet meross_iot's own chatty loggers.
-    log.propagate = False
-    for noisy in ("meross_iot", "paho", "asyncio", "aiohttp"):
-        lg = logging.getLogger(noisy)
-        lg.setLevel(logging.ERROR)
-        lg.propagate = False
 
 
 # -------- shared state ------------------------------------------------
@@ -398,89 +373,30 @@ class EnergyChart(QWidget):
 
     # -- position persistence --
     def _save_position(self) -> None:
-        try:
-            CONFIG_DIR.mkdir(exist_ok=True)
-            POSITION_FILE.write_text(json.dumps({"x": self.x(), "y": self.y()}))
-        except OSError:
-            pass
+        save_window_pos(POSITION_FILE, self)
 
     def _load_position(self) -> None:
-        try:
-            cfg = json.loads(POSITION_FILE.read_text())
-            self.move(cfg["x"], cfg["y"])
-        except (OSError, ValueError, KeyError):
-            screen = QApplication.primaryScreen().availableGeometry()
-            self.move(screen.center().x() - WINDOW_W // 2, screen.top() + 60)
-
-
-# -------- single-instance toggle --------------------------------------
-
-class SingleInstance:
-    def __init__(self) -> None:
-        self._name = "hardware-bar-meross-energy"
-        self._server: QLocalServer | None = None
-
-    def signal_existing(self) -> bool:
-        sock = QLocalSocket()
-        sock.connectToServer(self._name)
-        if not sock.waitForConnected(500):
-            return False
-        sock.write(b"close")
-        sock.flush()
-        sock.waitForBytesWritten(500)
-        sock.disconnectFromServer()
-        sock.waitForDisconnected(500)
-        return True
-
-    def become_primary(self, on_close: Callable[[], None]) -> None:
-        QLocalServer.removeServer(self._name)
-        self._server = QLocalServer()
-        if not self._server.listen(self._name):
-            log.error("listen failed: %s", self._server.errorString())
-            self._server = None
-            return
-
-        def _on_new_connection() -> None:
-            while self._server is not None and self._server.hasPendingConnections():
-                conn = self._server.nextPendingConnection()
-                conn.waitForReadyRead(500)
-                msg = bytes(conn.readAll()).decode("utf-8", "ignore")
-                conn.disconnectFromServer()
-                if "close" in msg:
-                    try:
-                        self._server.close()
-                    except Exception:
-                        pass
-                    QLocalServer.removeServer(self._name)
-                    self._server = None
-                    on_close()
-                    app = QApplication.instance()
-                    if app is not None:
-                        app.quit()
-
-        self._server.newConnection.connect(_on_new_connection)
+        screen = QApplication.primaryScreen().availableGeometry()
+        load_window_pos(POSITION_FILE, self,
+                        (screen.center().x() - WINDOW_W // 2, screen.top() + 60))
 
 
 # -------- entry -------------------------------------------------------
 
 def main() -> int:
-    _setup_logging()
-    log.info("=" * 60)
-    log.info("launch argv=%s log=%s", sys.argv[1:], LOG_PATH)
+    _, log_path = setup_logging("meross.chart", "hardware-bar-meross-chart.log")
+    _quiet_meross_loggers()
+    log.info("launch argv=%s log=%s", sys.argv[1:], log_path)
 
     app = QApplication(sys.argv)
-
-    single = SingleInstance()
+    single = SingleInstance("hardware-bar-meross-energy", log)
     if single.signal_existing():
-        log.info("signaled existing chart — exiting")
         return 0
 
     win = EnergyChart()
     single.become_primary(win.close)
     win.show()
-    rc = app.exec()
-    log.info("event loop exited rc=%s", rc)
-    return rc
+    return app.exec()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,10 @@ Usage:
 from __future__ import annotations
 
 import socket
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 48736
@@ -37,6 +40,38 @@ def send(cmd: str) -> tuple[int, str]:
         return 3, f"daemon not reachable: {e}"
 
 
+def _spawn_daemon() -> None:
+    """Launch the daemon detached so the client can exit while it keeps running.
+
+    Called on first "daemon not reachable" — the user no longer has to
+    start the daemon manually before using the brightness dials. Costs
+    ~500ms on the first dial press of a session; subsequent presses hit
+    the live daemon.
+    """
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    root = Path(__file__).resolve().parent.parent
+    subprocess.Popen(
+        [sys.executable, "-m", "brightness.daemon"],
+        cwd=str(root),
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_for_daemon(timeout_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rc, _ = send("ping")
+        if rc == 0:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args:
@@ -55,7 +90,10 @@ def main() -> int:
         return 2
 
     rc, reply = send(cmd)
-    # Print so --list / --ping work from a real console; pythonw discards this.
+    if rc == 3 and cmd != "ping":
+        _spawn_daemon()
+        if _wait_for_daemon():
+            rc, reply = send(cmd)
     print(reply)
     return rc
 

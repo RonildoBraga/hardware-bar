@@ -26,23 +26,33 @@ once, then in the tray icon:
 
 Close LHM via the tray icon so these settings persist.
 
-**Register auto-start** — right-click **`scripts\install\register-lhm-task.bat`** → Run as
-administrator. The script creates an ONLOGON Task Scheduler entry (admin
-elevation baked in), starts LHM immediately, and confirms port 8085 is live.
+**Register the on-demand task** — right-click
+**`scripts\install\register-lhm-task.bat`** → Run as administrator. This
+registers a Task Scheduler entry with `/RL HIGHEST` and **no triggers**, so
+LHM never starts on its own. What it buys you is the permission grant: the
+bar can fire `schtasks /Run /TN LibreHardwareMonitor` and LHM launches
+elevated silently, no UAC prompt.
 
-## Auto-start the full stack on login
+## Startup model
 
-Run these three installers once each; together they bring up everything on every
-reboot without manual steps.
+Nothing in this project auto-starts on login. Everything is manual or
+lazy-launched:
 
-| Component         | Installer                                                    | Admin? |
-|-------------------|--------------------------------------------------------------|--------|
-| LHM               | `scripts\install\register-lhm-task.bat`                      | yes    |
-| Brightness daemon | `scripts\install\install-brightness-daemon-autostart.bat`    | no     |
-| Hardware bar      | `scripts\install\install-bar-autostart.bat`                  | no     |
+| Component              | How it starts                                                                                   |
+|------------------------|-------------------------------------------------------------------------------------------------|
+| Hardware bar + charts  | Manual — `scripts\launchers\run.bat` (or a Loupedeck key bound to `pythonw -m bar`)             |
+| Brightness daemon      | Auto — `brightness.client` spawns it the first time a dial press finds it unreachable           |
+| LibreHardwareMonitor   | Auto — the bar's Poller calls `schtasks /Run` the first time `localhost:8085` is unreachable    |
 
-Each `install-*` script drops a shortcut in the user Startup folder and starts
-the component immediately. Pass `-Uninstall` to remove.
+Only LHM needs a one-time admin install (see *Register the on-demand task*
+above). The brightness daemon needs nothing — the client spawns it via
+`pythonw -m brightness.daemon` on demand. Both auto-launch paths are
+idempotent: if the service is already running, nothing extra happens.
+
+The legacy Startup-folder installers
+(`install-bar-autostart.*`, `install-brightness-daemon-autostart.*`) are kept
+in `scripts/install/` for anyone who wants the old login-start behaviour back;
+pass `-Uninstall` to remove a shortcut they previously installed.
 
 ## Run / usage
 
@@ -322,9 +332,9 @@ hardware-bar/
 │   │   ├── audio-debug.bat                    visible-console audio CLI
 │   │   └── meross-debug.bat                   visible-console meross CLI
 │   └── install/                               one-time installers
-│       ├── register-lhm-task.bat / .ps1       admin ONLOGON task for LHM
-│       ├── install-bar-autostart.bat / .ps1   user Startup shortcut for the bar
-│       └── install-brightness-daemon-autostart.bat / .ps1   ditto for the daemon
+│       ├── register-lhm-task.bat / .ps1       admin on-demand task for LHM (no autostart)
+│       ├── install-bar-autostart.bat / .ps1   user Startup shortcut for the bar (legacy)
+│       └── install-brightness-daemon-autostart.bat / .ps1   ditto for the daemon (legacy)
 │
 └── vendor/
     └── LibreHardwareMonitor/                  vendored LHM (gitignored)
@@ -344,5 +354,6 @@ be the project root.
 | `C:\...\hardware-bar\nightlight.py --toggle`         | `-m nightlight --toggle`              |
 | `C:\...\hardware-bar\bar.py`                         | `-m bar`                              |
 
-Autostart shortcuts installed before the reorg also point at the old paths
-— re-run the three `scripts\install\install-*.bat` scripts to refresh them.
+If you previously ran the old Startup-folder installers, they're already
+obsolete under the current lazy-launch model — uninstall any leftovers with
+`scripts\install\install-*-autostart.bat -Uninstall`.

@@ -22,7 +22,6 @@ import json
 import logging
 import re
 import sys
-import tempfile
 from ctypes import HRESULT, c_int
 from ctypes.wintypes import LPCWSTR
 from pathlib import Path
@@ -36,7 +35,11 @@ from pycaw.pycaw import (
     IMMDeviceEnumerator,
 )
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-audio.log"
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import setup_logging
+
 log = logging.getLogger("audio")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -77,24 +80,6 @@ class IPolicyConfig(IUnknown):
 class OutputDevice(NamedTuple):
     id:   str
     name: str
-
-
-# -------- logging (only initialised in CLI main) -----------------------
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass  # pythonw has no stderr
 
 
 # -------- filter file --------------------------------------------------
@@ -267,10 +252,9 @@ def get_status() -> dict:
 # -------- CLI ----------------------------------------------------------
 
 def main() -> int:
-    _setup_logging()
+    _, log_path = setup_logging("audio", "hardware-bar-audio.log")
     args = sys.argv[1:]
-    log.info("=" * 50)
-    log.info("launch argv=%s log=%s", args, LOG_PATH)
+    log.info("launch argv=%s log=%s", args, log_path)
 
     if not args or args[0] in ("-h", "--help", "help"):
         print(__doc__)

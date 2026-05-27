@@ -19,34 +19,20 @@ from __future__ import annotations
 import logging
 import socket
 import sys
-import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
 
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import setup_logging
 from . import core as br  # reuse the existing helpers
 
 HOST = "127.0.0.1"
 PORT = 48736
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-brightness-daemon.log"
 log = logging.getLogger("brightness-daemon")
-
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass
 
 
 # Cached display index; refreshed on startup / on `refresh` / after errors.
@@ -199,9 +185,8 @@ def dispatch(line: str) -> tuple[str, bool]:
 
 
 def serve() -> int:
-    _setup_logging()
-    log.info("=" * 50)
-    log.info("starting daemon on %s:%d  log=%s", HOST, PORT, LOG_PATH)
+    _, log_path = setup_logging("brightness-daemon", "hardware-bar-brightness-daemon.log")
+    log.info("starting daemon on %s:%d log=%s", HOST, PORT, log_path)
 
     try:
         refresh_displays()

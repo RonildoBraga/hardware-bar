@@ -18,31 +18,20 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
-import tempfile
 from ctypes import wintypes
 from pathlib import Path
 from typing import NamedTuple, Optional
 
 from monitorcontrol import get_monitors, Monitor, VCPError
 
-LOG_PATH = Path(tempfile.gettempdir()) / "hardware-bar-brightness.log"
+# Ensure project root on sys.path for the _common import when launched as
+# `pythonw.exe C:\...\brightness\core.py` directly (no working-dir).
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import setup_logging
+
 log = logging.getLogger("brightness")
-
-
-def _setup_logging() -> None:
-    log.setLevel(logging.INFO)
-    log.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(process)5d] %(levelname)s: %(message)s",
-                            datefmt="%H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
-    except Exception:
-        pass  # pythonw has no stderr
 
 # -------- Win32 DisplayConfig API via ctypes -----------------------------
 
@@ -378,10 +367,9 @@ def adjust(index: int, delta: int) -> int:
 
 
 def main() -> int:
-    _setup_logging()
+    _, log_path = setup_logging("brightness", "hardware-bar-brightness.log")
     args = sys.argv[1:]
-    log.info("=" * 50)
-    log.info("launch argv=%s  log=%s", args, LOG_PATH)
+    log.info("launch argv=%s log=%s", args, log_path)
 
     if not args or args[0] in ("-h", "--help", "help"):
         print(__doc__)

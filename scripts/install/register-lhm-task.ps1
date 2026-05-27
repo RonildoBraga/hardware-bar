@@ -1,9 +1,14 @@
-# Registers a Task Scheduler entry that starts LibreHardwareMonitor at user
-# logon with admin rights. The admin rights are required for LHM to read CPU
-# MSRs (temperatures, power) and motherboard fan tachos.
+# Registers a Task Scheduler entry for LibreHardwareMonitor as an ON-DEMAND
+# admin task (no automatic trigger). After registration, the bar can fire
+# `schtasks /Run /TN LibreHardwareMonitor` and LHM launches elevated with no
+# UAC prompt, because Task Scheduler holds the stored admin consent.
 #
-# Uses schtasks.exe (not the ScheduledTasks cmdlets) for maximum compatibility
-# across Windows versions. Invoked by register-lhm-task.bat which handles
+# LHM needs admin rights to read CPU MSRs (temps, power) and motherboard fan
+# tachos. Running elevated via this task is what lets the bar fetch those
+# values automatically without prompting the user every time.
+#
+# Uses schtasks.exe + /XML so the task is registered with NO triggers — the
+# ONDEMAND-only behaviour. Invoked by register-lhm-task.bat which handles
 # elevation.
 
 $ErrorActionPreference = "Stop"
@@ -31,10 +36,51 @@ try {
     # task didn't exist - fine, we were going to delete it anyway
 }
 
-# Create the task: run at logon, as this user, with highest privileges.
-$quotedExe = '"' + $exe + '"'
-& schtasks.exe /Create /TN $name /TR $quotedExe /SC ONLOGON /RU $user /RL HIGHEST /F
-$schtasksExit = $LASTEXITCODE
+# Build a Task Scheduler XML definition with NO <Triggers> element, so the
+# task only runs when explicitly triggered via schtasks /Run.
+# RunLevel=HighestAvailable is what allows LHM to read CPU MSRs.
+$xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <UserId>$user</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$exe</Command>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+# schtasks requires UTF-16 (the XML declaration says so).
+$tmp = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText($tmp, $xml, [System.Text.Encoding]::Unicode)
+    & schtasks.exe /Create /TN $name /XML $tmp /F
+    $schtasksExit = $LASTEXITCODE
+} finally {
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
 
@@ -52,33 +98,12 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "Task registered and verified." -ForegroundColor Green
+Write-Host "Task registered (on-demand, no automatic trigger)." -ForegroundColor Green
 Write-Host ""
 & schtasks.exe /Query /TN $name /XML 2>$null |
-    Select-String -Pattern "RunLevel|UserId|LogonTrigger|<Enabled>true" |
+    Select-String -Pattern "RunLevel|UserId|<Enabled>true|AllowStartOnDemand" |
     ForEach-Object { "  " + $_.Line.Trim() }
 
 Write-Host ""
-Write-Host "Starting LHM now (so you don't have to reboot)..." -ForegroundColor Cyan
-& schtasks.exe /Run /TN $name | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Couldn't kick off the task via schtasks /Run (exit $LASTEXITCODE)." -ForegroundColor Yellow
-    Write-Host "Launch LibreHardwareMonitor.exe manually this once." -ForegroundColor Yellow
-} else {
-    # Wait up to 10s for the web server to come up on 8085.
-    $ok = $false
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 500
-        try {
-            $r = Invoke-WebRequest -Uri "http://localhost:8085/data.json" -UseBasicParsing -TimeoutSec 1
-            if ($r.StatusCode -eq 200) { $ok = $true; break }
-        } catch {}
-    }
-    if ($ok) {
-        Write-Host "LHM is live on http://localhost:8085 - bar values will populate within 1s." -ForegroundColor Green
-    } else {
-        Write-Host "LHM started but port 8085 isn't responding yet." -ForegroundColor Yellow
-        Write-Host "If it stays this way, open LHM's tray icon and enable:" -ForegroundColor Yellow
-        Write-Host "  Options -> Remote Web Server -> Port=8085 and Run"
-    }
-}
+Write-Host "Done. The bar will auto-trigger this task when it first needs LHM." -ForegroundColor Cyan
+Write-Host "(LHM will NOT start on logon anymore.)"
