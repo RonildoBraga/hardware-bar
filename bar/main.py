@@ -32,13 +32,15 @@ if __name__ == "__main__" and __package__ in (None, ""):
 
 import audio
 import nightlight
-from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPoint, QObject, QThread, pyqtSignal, pyqtSlot, QMetaObject
 from PyQt6.QtGui import QAction, QFont, QFontDatabase
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QWidget, QHBoxLayout
 
 from _common import (
-    SingleInstance, load_window_pos, publish_sample, save_window_pos, setup_logging,
+    SingleInstance, colored, fmt as _fmt, load_window_pos, publish_sample,
+    save_window_pos, setup_logging,
 )
+from brightness.protocol import HOST as BRIGHTNESS_HOST, PORT as BRIGHTNESS_PORT, parse_status
 
 LHM_URL = "http://localhost:8085/data.json"
 LHM_TIMEOUT_S = 0.5
@@ -50,8 +52,6 @@ CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.local.json"
 # from bar.charts doesn't create a log file as a side-effect.
 log = logging.getLogger("bar")
 
-BRIGHTNESS_HOST = "127.0.0.1"
-BRIGHTNESS_PORT = 48736
 BRIGHTNESS_TIMEOUT_S = 0.15  # fail fast if daemon is down/slow
 # Order to display brightness values in the bar. Each entry is a daemon
 # index (same as `brightness_client.py --list`). Daemon order is
@@ -350,31 +350,11 @@ def _poll_brightness() -> list[int | None]:
         with socket.create_connection((BRIGHTNESS_HOST, BRIGHTNESS_PORT),
                                       timeout=BRIGHTNESS_TIMEOUT_S) as s:
             s.sendall(b"status\n")
-            reply = s.recv(512).decode("utf-8", errors="replace").strip()
+            reply = s.recv(512).decode("utf-8", errors="replace")
     except (OSError, socket.timeout):
         return []
 
-    if not reply or reply.startswith("err"):
-        return []
-
-    # 'i:pct' tokens, sorted by index so output order is stable
-    parsed: dict[int, int | None] = {}
-    for tok in reply.split():
-        if ":" not in tok:
-            continue
-        i_str, v_str = tok.split(":", 1)
-        try:
-            i = int(i_str)
-        except ValueError:
-            continue
-        try:
-            parsed[i] = int(v_str)
-        except ValueError:
-            parsed[i] = None
-
-    if not parsed:
-        return []
-    return [parsed.get(i) for i in range(max(parsed) + 1)]
+    return parse_status(reply)
 
 
 # -------- LHM tree parsing ----------------------------------------------
@@ -528,14 +508,6 @@ def _attach_disk_readings(disks: list[DiskReading], parsed: _LhmReadings) -> Non
 # -------- ui -------------------------------------------------------------
 
 
-def _fmt(val: float | None, unit: str, digits: int = 0) -> str:
-    if val is None:
-        return f"--{unit}"
-    if digits == 0:
-        return f"{val:.0f}{unit}"
-    return f"{val:.{digits}f}{unit}"
-
-
 def _abbreviate_device(name: str, max_len: int = 16) -> str:
     """Strip the " (driver name)" suffix Windows appends, then cap length."""
     paren = name.find(" (")
@@ -554,9 +526,7 @@ def _color_for(key: str, val: float | None) -> str:
 
 
 def _colored(text: str, color: str) -> str:
-    if color == COLOR_DEFAULT:
-        return text
-    return f'<span style="color:{color}">{text}</span>'
+    return colored(text, color, COLOR_DEFAULT)
 
 
 def render(s: Sample) -> str:
@@ -672,6 +642,38 @@ def render(s: Sample) -> str:
     return "&nbsp;&nbsp;&nbsp;".join(sections)
 
 
+class PollWorker(QObject):
+    """Runs the Poller on a background thread so blocking I/O (the LHM HTTP
+    request and the brightness socket) never stalls the GUI. Owns a QTimer
+    that lives in the worker thread once `start` runs there; each tick emits
+    the fresh Sample back to the GUI thread via the `sampled` signal."""
+
+    sampled = pyqtSignal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._poller: Poller | None = None
+        self._timer: QTimer | None = None
+
+    @pyqtSlot()
+    def start(self) -> None:
+        self._poller = Poller()  # init NVML/PDH on the worker thread
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start(REFRESH_MS)
+        self._poll()
+
+    @pyqtSlot()
+    def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+
+    def _poll(self) -> None:
+        sample = self._poller.sample()
+        publish_sample(sample)  # off-thread file write so bar.charts can subscribe
+        self.sampled.emit(sample)
+
+
 class Bar(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -704,20 +706,27 @@ class Bar(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label)
 
-        self.poller = Poller()
-
         self._load_position()
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(REFRESH_MS)
-        self._tick()
+        # Poll on a worker thread so blocking I/O can't freeze the UI.
+        self._poll_thread = QThread(self)
+        self._worker = PollWorker()
+        self._worker.moveToThread(self._poll_thread)
+        self._poll_thread.started.connect(self._worker.start)
+        self._worker.sampled.connect(self._on_sample)
+        self._poll_thread.start()
 
-    def _tick(self) -> None:
-        sample = self.poller.sample()
-        publish_sample(sample)  # so bar.charts can subscribe instead of polling
+    def _on_sample(self, sample: Sample) -> None:
         self.label.setText(render(sample))
         self.adjustSize()
+
+    def shutdown(self) -> None:
+        """Stop the worker's timer and join its thread before the app exits."""
+        QMetaObject.invokeMethod(
+            self._worker, "stop", Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self._poll_thread.quit()
+        self._poll_thread.wait(2000)
 
     # -- drag --
     def mousePressEvent(self, event) -> None:
@@ -760,6 +769,7 @@ def main() -> int:
 
     bar = Bar()
     single.become_primary(bar.close)
+    app.aboutToQuit.connect(bar.shutdown)
     bar.show()
     return app.exec()
 

@@ -109,8 +109,7 @@ def _endpoint_volume():
         return None, None
 
 
-def get_volume_pct() -> int | None:
-    _, ev = _endpoint_volume()
+def _read_volume(ev) -> int | None:
     if ev is None:
         return None
     try:
@@ -119,14 +118,23 @@ def get_volume_pct() -> int | None:
         return None
 
 
-def get_mute() -> bool | None:
-    _, ev = _endpoint_volume()
+def _read_mute(ev) -> bool | None:
     if ev is None:
         return None
     try:
         return bool(ev.GetMute())
     except Exception:
         return None
+
+
+def get_volume_pct() -> int | None:
+    _, ev = _endpoint_volume()
+    return _read_volume(ev)
+
+
+def get_mute() -> bool | None:
+    _, ev = _endpoint_volume()
+    return _read_mute(ev)
 
 
 def set_volume_delta(delta_pct: int) -> int | None:
@@ -240,12 +248,22 @@ def cycle_output() -> OutputDevice | None:
 # -------- snapshot for bar ---------------------------------------------
 
 def get_status() -> dict:
-    cur = get_default_device()
+    # One GetSpeakers round-trip for volume, mute, and device identity — the
+    # bar polls this every tick, so the previous 3x re-fetch was wasteful.
+    spk, ev = _endpoint_volume()
+    name: str | None = None
+    dev_id: str | None = None
+    if spk is not None:
+        try:
+            name = spk.FriendlyName or "<unknown>"
+            dev_id = spk.id
+        except Exception:
+            pass
     return {
-        "volume":    get_volume_pct(),
-        "mute":      get_mute(),
-        "device":    cur.name if cur else None,
-        "device_id": cur.id   if cur else None,
+        "volume":    _read_volume(ev),
+        "mute":      _read_mute(ev),
+        "device":    name,
+        "device_id": dev_id,
     }
 
 

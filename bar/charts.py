@@ -39,7 +39,8 @@ if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from _common import (
-    SingleInstance, load_window_pos, read_published_sample, save_window_pos, setup_logging,
+    SingleInstance, colored as _colored, fmt as _fmt, load_window_pos,
+    read_published_sample, save_window_pos, setup_logging,
 )
 from bar import Poller, Sample
 
@@ -94,16 +95,6 @@ def _disk_activity_series(label_prefix: str, idx: int, color: str):
 
 
 # -------- header formatters --------------------------------------------
-
-def _fmt(val: float | None, unit: str, digits: int = 0) -> str:
-    if val is None:
-        return f"--{unit}"
-    return f"{val:.{digits}f}{unit}"
-
-
-def _colored(text: str, color: str) -> str:
-    return f'<span style="color:{color}">{text}</span>'
-
 
 def _h_cpu(s: Sample) -> str:
     return "CPU " + _colored(_fmt(s.cpu_pct, "%"), "#4ea1ff")

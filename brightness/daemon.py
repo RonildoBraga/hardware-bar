@@ -28,9 +28,7 @@ if __name__ == "__main__" and __package__ in (None, ""):
 
 from _common import setup_logging
 from . import core as br  # reuse the existing helpers
-
-HOST = "127.0.0.1"
-PORT = 48736
+from .protocol import HOST, PORT, format_status
 
 log = logging.getLogger("brightness-daemon")
 
@@ -76,20 +74,17 @@ def handle_adjust(index: int, delta: int) -> str:
     hdr_on = br.is_hdr_enabled(target)
 
     if hdr_on:
-        cur_wl = br.get_sdr_white_level(target)
-        cur_pct = br.sdr_wl_to_pct(cur_wl)
-        new_pct = max(0, min(100, cur_pct + delta))
-        new_wl = br.sdr_pct_to_wl(new_pct)
-        if new_wl == cur_wl:
+        a = br.compute_hdr_adjust(target, delta)
+        if a.new_wl == a.cur_wl:
             log.info("adjust[%d] %s hdr +%d noop (at %s)", index, target.name,
-                     delta, "max" if new_pct >= 100 else ("min" if new_pct <= 0 else f"{cur_pct}%"))
-            return f"ok noop hdr pct={cur_pct}"
-        ok = br.set_sdr_white_level(target, new_wl)
+                     delta, "max" if a.new_pct >= 100 else ("min" if a.new_pct <= 0 else f"{a.cur_pct}%"))
+            return f"ok noop hdr pct={a.cur_pct}"
+        ok = br.set_sdr_white_level(target, a.new_wl)
         log.info("adjust[%d] %s hdr wl %d->%d (%d%%->%d%%) %s",
-                 index, target.name, cur_wl, new_wl, cur_pct, new_pct,
+                 index, target.name, a.cur_wl, a.new_wl, a.cur_pct, a.new_pct,
                  "ok" if ok else "FAILED")
-        return (f"ok hdr wl={cur_wl}->{new_wl} pct={cur_pct}->{new_pct}"
-                if ok else f"err set_sdr_white_level failed ({cur_wl}->{new_wl})")
+        return (f"ok hdr wl={a.cur_wl}->{a.new_wl} pct={a.cur_pct}->{a.new_pct}"
+                if ok else f"err set_sdr_white_level failed ({a.cur_wl}->{a.new_wl})")
 
     # SDR / DDC path
     if m is None:
@@ -121,15 +116,13 @@ def handle_status() -> str:
     rows = _snapshot()
     with _lock:
         cache = dict(_ddc_cache)
-    parts: list[str] = []
+    pairs: list[tuple[int, int | None]] = []
     for i, (t, _) in enumerate(rows):
         if br.is_hdr_enabled(t):
-            pct = br.sdr_wl_to_pct(br.get_sdr_white_level(t))
-            parts.append(f"{i}:{pct}")
+            pairs.append((i, br.sdr_wl_to_pct(br.get_sdr_white_level(t))))
         else:
-            v = cache.get(i)
-            parts.append(f"{i}:{v if v is not None else '-'}")
-    return " ".join(parts) if parts else "-"
+            pairs.append((i, cache.get(i)))
+    return format_status(pairs) if pairs else "-"
 
 
 def handle_list() -> str:

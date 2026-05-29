@@ -1,21 +1,12 @@
-"""Brightness control — DDC/CI + HDR SDRWhiteLevel helpers, daemon, client."""
+"""Brightness control — DDC/CI + HDR SDRWhiteLevel helpers, daemon, client.
 
-from .core import (
-    DisplayTarget,
-    build_display_index,
-    get_sdr_white_level,
-    is_hdr_enabled,
-    sdr_pct_to_wl,
-    sdr_wl_to_pct,
-    set_sdr_white_level,
-)
+Submodules:
+    core      display enumeration, HDR detection, DDC/SDR-white-level helpers
+    daemon    long-running adjuster that holds display state in memory
+    client    thin TCP client the Loupedeck calls
+    protocol  dependency-free wire constants + status codec
 
-__all__ = [
-    "DisplayTarget",
-    "build_display_index",
-    "get_sdr_white_level",
-    "is_hdr_enabled",
-    "sdr_pct_to_wl",
-    "sdr_wl_to_pct",
-    "set_sdr_white_level",
-]
+Nothing is re-exported here on purpose: `core` pulls in monitorcontrol/ctypes,
+so importing the package (e.g. `from brightness.protocol import ...`) must stay
+cheap for the bar and client.
+"""

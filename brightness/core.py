@@ -251,6 +251,24 @@ def sdr_wl_to_pct(wl: int) -> int:
     return int(round((wl - SDR_WL_MIN) / (SDR_WL_MAX - SDR_WL_MIN) * 100))
 
 
+class HdrAdjust(NamedTuple):
+    cur_wl: int
+    new_wl: int
+    cur_pct: int
+    new_pct: int
+
+
+def compute_hdr_adjust(target: DisplayTarget, delta: int) -> HdrAdjust:
+    """Read the current HDR SDR-white-level for `target` and compute where a
+    signed `delta` (in percent) lands. Shared by the offline CLI (core.adjust)
+    and the daemon so the clamp + percent<->white-level mapping lives once."""
+    cur_wl = get_sdr_white_level(target)
+    cur_pct = sdr_wl_to_pct(cur_wl)
+    new_pct = max(0, min(100, cur_pct + delta))
+    new_wl = sdr_pct_to_wl(new_pct)
+    return HdrAdjust(cur_wl, new_wl, cur_pct, new_pct)
+
+
 def _monitor_name(m: Monitor) -> str:
     """Best-effort model name from monitorcontrol. Returns '' if unavailable."""
     try:
@@ -341,13 +359,10 @@ def adjust(index: int, delta: int) -> int:
              index, target.name, hdr_on, delta)
 
     if hdr_on:
-        cur_wl = get_sdr_white_level(target)
-        cur_pct = sdr_wl_to_pct(cur_wl)
-        new_pct = max(0, min(100, cur_pct + delta))
-        new_wl = sdr_pct_to_wl(new_pct)
-        ok = set_sdr_white_level(target, new_wl)
+        adj = compute_hdr_adjust(target, delta)
+        ok = set_sdr_white_level(target, adj.new_wl)
         log.info("  HDR path: sdr_wl %d -> %d (%d%% -> %d%%)  result=%s",
-                 cur_wl, new_wl, cur_pct, new_pct, "ok" if ok else "FAILED")
+                 adj.cur_wl, adj.new_wl, adj.cur_pct, adj.new_pct, "ok" if ok else "FAILED")
         return 0 if ok else 1
 
     # SDR path: DDC/CI

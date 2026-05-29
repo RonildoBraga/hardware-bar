@@ -44,6 +44,22 @@ def setup_logging(name: str, log_filename: str) -> tuple[logging.Logger, Path]:
     return log, log_path
 
 
+def fmt(val: float | None, unit: str, digits: int = 0) -> str:
+    """Format a metric value with its unit, or '--<unit>' when missing."""
+    if val is None:
+        return f"--{unit}"
+    return f"{val:.{digits}f}{unit}"
+
+
+def colored(text: str, color: str, default: str | None = None) -> str:
+    """Wrap text in a coloured HTML span. If `default` is given and equals
+    `color`, return the text unwrapped — keeps the bar's markup lean for the
+    common (default-colour) case."""
+    if default is not None and color == default:
+        return text
+    return f'<span style="color:{color}">{text}</span>'
+
+
 def publish_sample(sample: Any) -> None:
     """Atomically write the current Sample to SAMPLE_FILE. Silent on error."""
     try:

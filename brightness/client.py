@@ -19,8 +19,10 @@ import sys
 import time
 from pathlib import Path
 
-HOST = "127.0.0.1"
-PORT = 48736
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from brightness.protocol import HOST, PORT
 
 
 def send(cmd: str) -> tuple[int, str]:
