@@ -4,23 +4,23 @@ it without depending on the bar package.
 
 Provides:
     setup_logging(name, filename)        attach file+stderr handlers to a named logger
-    publish_sample / read_published_sample  bar↔chart pickle broadcast
+    publish_sample / read_published_sample  bar↔chart JSON broadcast
     save_window_pos / load_window_pos    JSON {x,y} persistence for frameless windows
     SingleInstance(name, log)            QLocalServer one-instance toggle (Qt lazy)
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 import json
 import logging
-import pickle
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-SAMPLE_FILE = Path(tempfile.gettempdir()) / "hardware-bar-sample.pickle"
+SAMPLE_FILE = Path(tempfile.gettempdir()) / "hardware-bar-sample.json"
 SAMPLE_STALE_S = 3.0  # > REFRESH_MS * 2; older = bar not running
 
 
@@ -63,21 +63,22 @@ def colored(text: str, color: str, default: str | None = None) -> str:
 def publish_sample(sample: Any) -> None:
     """Atomically write the current Sample to SAMPLE_FILE. Silent on error."""
     try:
+        data = asdict(sample) if is_dataclass(sample) else sample
         tmp = SAMPLE_FILE.with_suffix(".tmp")
-        tmp.write_bytes(pickle.dumps(sample))
+        tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
         tmp.replace(SAMPLE_FILE)
-    except OSError:
+    except (OSError, TypeError):
         pass
 
 
-def read_published_sample() -> Any | None:
-    """Return the most recent published Sample if fresh (within SAMPLE_STALE_S), else None."""
+def read_published_sample() -> dict[str, Any] | None:
+    """Return the most recent published sample dict if fresh, else None."""
     try:
         st = SAMPLE_FILE.stat()
         if time.time() - st.st_mtime > SAMPLE_STALE_S:
             return None
-        return pickle.loads(SAMPLE_FILE.read_bytes())
-    except (OSError, pickle.UnpicklingError, EOFError, AttributeError):
+        return json.loads(SAMPLE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
 
 

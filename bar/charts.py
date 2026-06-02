@@ -42,7 +42,7 @@ from _common import (
     SingleInstance, colored as _colored, fmt as _fmt, load_window_pos,
     read_published_sample, save_window_pos, setup_logging,
 )
-from bar import Poller, Sample
+from bar.main import DiskReading, Sample
 
 WINDOW_W = 460
 WINDOW_H = 230
@@ -56,22 +56,12 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent / ".charts"
 log = logging.getLogger("charts")
 
 
-class SampleSource:
-    """Read samples from the running bar's broadcast file if available; otherwise
-    fall back to a locally-owned Poller. Multiple charts open at once share the
-    bar's poll output instead of multiplying HTTP/NVML/COM traffic."""
-
-    def __init__(self) -> None:
-        self._local: Poller | None = None
-
-    def sample(self) -> Sample:
-        published = read_published_sample()
-        if published is not None:
-            return published
-        if self._local is None:
-            log.info("bar not broadcasting; falling back to local Poller")
-            self._local = Poller()
-        return self._local.sample()
+def _sample_from_json(data: dict | None) -> Sample:
+    if not data:
+        return Sample()
+    data = dict(data)
+    data["disks"] = [DiskReading(**d) for d in data.get("disks") or []]
+    return Sample(**data)
 
 
 @dataclass
@@ -336,10 +326,6 @@ class ChartWindow(QWidget):
         # Esc closes
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
 
-        # Sample source + timer. Prefers the running bar's broadcast file;
-        # falls back to a local Poller if the bar isn't running.
-        self.source = SampleSource()
-
         self._load_position()
 
         self.timer = QTimer(self)
@@ -349,7 +335,7 @@ class ChartWindow(QWidget):
 
     # -- polling --
     def _tick(self) -> None:
-        sample = self.source.sample()
+        sample = _sample_from_json(read_published_sample())
         for i, (_, _, extract) in enumerate(self._spec.series):
             val = extract(sample)
             self._buffers[i].append(val)

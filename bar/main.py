@@ -44,12 +44,13 @@ from brightness.protocol import HOST as BRIGHTNESS_HOST, PORT as BRIGHTNESS_PORT
 
 LHM_URL = "http://localhost:8085/data.json"
 LHM_TIMEOUT_S = 0.5
+LHM_CACHE_TTL_S = 30.0
+LHM_FAILURE_LOG_INTERVAL_S = 30.0
 LHM_TASK_NAME = "LibreHardwareMonitor"
 REFRESH_MS = 1000
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.local.json"
 
-# Handlers attached lazily in main() so `from bar import Sample/Poller`
-# from bar.charts doesn't create a log file as a side-effect.
+# Handlers attached lazily in main() so imports don't create log files.
 log = logging.getLogger("bar")
 
 BRIGHTNESS_TIMEOUT_S = 0.15  # fail fast if daemon is down/slow
@@ -207,6 +208,9 @@ class Poller:
         # LHM auto-spawn: set once per Poller lifetime on first unreachable
         # LHM, so we don't spam schtasks every second.
         self._lhm_spawn_tried = False
+        self._last_lhm: _LhmReadings | None = None
+        self._last_lhm_at: float | None = None
+        self._last_lhm_failure_log = 0.0
 
     def sample(self) -> Sample:
         s = Sample()
@@ -296,18 +300,42 @@ class Poller:
             r = requests.get(LHM_URL, timeout=LHM_TIMEOUT_S)
             r.raise_for_status()
             parsed = _parse_lhm(r.json())
-            s.cpu_temp_c = parsed.cpu_temp_c
-            s.cpu_power_w = parsed.cpu_power_w
-            s.gpu_fan_rpm = parsed.gpu_fan_rpm
-            s.case_fans = [(n, parsed.motherboard_fans.get(n)) for n in CASE_FAN_NUMBERS]
-            if AIO_FAN_NUMBER is not None:
-                s.aio_rpm = parsed.motherboard_fans.get(AIO_FAN_NUMBER)
-            if s.disks:
-                _attach_disk_readings(s.disks, parsed)
-        except (requests.RequestException, ValueError):
+            self._last_lhm = parsed
+            self._last_lhm_at = time.monotonic()
+            self._apply_lhm_readings(s, parsed)
+        except (requests.RequestException, ValueError) as e:
+            if self._apply_cached_lhm_readings(s):
+                self._log_lhm_failure("using cached LHM readings", e)
+            else:
+                self._log_lhm_failure("no cached LHM readings available", e)
             self._maybe_start_lhm()
 
         return s
+
+    def _apply_lhm_readings(self, sample: Sample, parsed: _LhmReadings) -> None:
+        sample.cpu_temp_c = parsed.cpu_temp_c
+        sample.cpu_power_w = parsed.cpu_power_w
+        sample.gpu_fan_rpm = parsed.gpu_fan_rpm
+        sample.case_fans = [(n, parsed.motherboard_fans.get(n)) for n in CASE_FAN_NUMBERS]
+        if AIO_FAN_NUMBER is not None:
+            sample.aio_rpm = parsed.motherboard_fans.get(AIO_FAN_NUMBER)
+        if sample.disks:
+            _attach_disk_readings(sample.disks, parsed)
+
+    def _apply_cached_lhm_readings(self, sample: Sample) -> bool:
+        if self._last_lhm is None or self._last_lhm_at is None:
+            return False
+        if time.monotonic() - self._last_lhm_at > LHM_CACHE_TTL_S:
+            return False
+        self._apply_lhm_readings(sample, self._last_lhm)
+        return True
+
+    def _log_lhm_failure(self, detail: str, exc: Exception) -> None:
+        now = time.monotonic()
+        if now - self._last_lhm_failure_log < LHM_FAILURE_LOG_INTERVAL_S:
+            return
+        self._last_lhm_failure_log = now
+        log.info("LHM poll failed (%s): %s: %s", detail, type(exc).__name__, exc)
 
     def _maybe_start_lhm(self) -> None:
         """Fire the on-demand LHM scheduled task once per Poller lifetime.
