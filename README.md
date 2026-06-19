@@ -390,6 +390,11 @@ Supported metric names: keys of `METRICS` in `bar/charts.py` (e.g. `cpu`,
 `cpu-gpu`, `temps`). Window positions persist under `.charts/`
 (gitignored). Log at `%TEMP%\hardware-bar-charts.log`.
 
+On macOS the metric set is retuned for the unified SoC: `gpu-temp` and `disk`
+(activity) are dropped (no discrete GPU temperature, no per-drive activity), the
+`disk-temps`/`temps` charts track the single internal SSD, CPU charts use a
+0–100% range (no Turbo), and the RAM range follows installed memory.
+
 ## Project layout
 
 Platform backends are split into `_win.py` / `_mac.py` behind each module's
