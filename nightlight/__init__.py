@@ -1,4 +1,4 @@
-"""Windows 11 Night Light toggle."""
+"""Blue-light reduction toggle — Windows Night Light / macOS Night Shift."""
 
 from .core import is_enabled, set_state, toggle
 

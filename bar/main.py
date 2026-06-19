@@ -1,28 +1,24 @@
-"""Minimalist hardware-monitor bar for Ronildo's ASUS / 12700F / RTX 3080 setup.
+"""Minimalist always-on-top hardware-monitor bar.
 
-Data sources:
-    - psutil       -> CPU %, RAM, network
-    - pynvml       -> GPU %, GPU temp, VRAM (RTX 3080)
-    - LHM HTTP     -> CPU package temp, NVMe SSD temp (requires LibreHardwareMonitor
-                      running with "Remote Web Server" enabled on port 8085)
+Cross-platform: the shared Poller reads CPU%/RAM/network (psutil) plus the
+brightness daemon, blue-light state, and audio; OS-specific telemetry comes
+from a platform sensor backend (bar/sensors.py):
+
+    Windows -> psutil + pynvml + LibreHardwareMonitor HTTP + PDH    (bar/_win.py)
+    macOS   -> psutil + a privileged powermetrics sampler           (bar/_mac.py)
+
+Fields a backend can't supply on a given machine stay None and render as `--`.
 """
 
 from __future__ import annotations
 
 import logging
 import socket
-import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import ctypes
-from ctypes import wintypes
-
 import psutil
-import pynvml
-import requests
 
 # Allow direct-file invocation (e.g. `pythonw.exe C:\...\bar\main.py`) by
 # Loupedeck bindings that only have File + Arguments fields and no
@@ -37,16 +33,24 @@ from PyQt6.QtGui import QAction, QFont, QFontDatabase
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QWidget, QHBoxLayout
 
 from _common import (
-    SingleInstance, colored, fmt as _fmt, load_window_pos, publish_sample,
-    save_window_pos, setup_logging,
+    IS_MACOS, SingleInstance, colored, fmt as _fmt, load_window_pos,
+    publish_sample, save_window_pos, setup_logging,
 )
 from brightness.protocol import HOST as BRIGHTNESS_HOST, PORT as BRIGHTNESS_PORT, parse_status
 
-LHM_URL = "http://localhost:8085/data.json"
-LHM_TIMEOUT_S = 0.5
-LHM_CACHE_TTL_S = 30.0
-LHM_FAILURE_LOG_INTERVAL_S = 30.0
-LHM_TASK_NAME = "LibreHardwareMonitor"
+# Data model + LHM parsing live in bar.model (pure, importable on any OS).
+# Re-exported here so tests/test_lhm.py and bar.charts keep importing them from
+# bar.main unchanged.
+from bar.model import (  # noqa: F401  (re-exported for tests/test_lhm.py + bar.charts)
+    DISKS,
+    DiskReading,
+    Sample,
+    _disk_subtree_sensors,
+    _parse_lhm,
+    _parse_lhm_value,
+)
+from bar.sensors import make_backend
+
 REFRESH_MS = 1000
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.local.json"
 
@@ -55,31 +59,9 @@ log = logging.getLogger("bar")
 
 BRIGHTNESS_TIMEOUT_S = 0.15  # fail fast if daemon is down/slow
 # Order to display brightness values in the bar. Each entry is a daemon
-# index (same as `brightness_client.py --list`). Daemon order is
-# 0=KAMN49QDQUCLA, 1=Smart TV, 2=Cintiq 16 — bar shows TV, KGN, Wacom.
+# index (same as `brightness.client --list`). Indices beyond the connected
+# display count are skipped, so a shorter macOS display set degrades cleanly.
 BRIGHTNESS_DISPLAY_ORDER: list[int] = [1, 0, 2]
-
-# Per-drive config.
-# psutil reports disks as PhysicalDrive<N>. LHM reports them by model name;
-# when two drives share a model (the BX500s), `lhm_index` picks the Nth match
-# in tree-order (0 = first, 1 = second).
-@dataclass
-class DiskSpec:
-    label: str
-    lhm_model: str
-    lhm_index: int = 0
-
-DISKS: list[DiskSpec] = [
-    DiskSpec("C", "CT1000P2SSD8",    0),  # P2 NVMe (OS)
-    DiskSpec("D", "CT2000T500SSD8",  0),  # T500 NVMe
-    DiskSpec("E", "CT2000BX500SSD1", 0),  # BX500 SATA #1
-    DiskSpec("F", "CT2000BX500SSD1", 1),  # BX500 SATA #2
-]
-
-# Motherboard fan wiring (Nuvoton NCT6798D on this B660-I).
-# LHM reports each header as "Fan #N"; these map to actual fan headers per build.
-AIO_FAN_NUMBER: int | None = 6       # AIO pump tacho on header #6
-CASE_FAN_NUMBERS: list[int] = [2]    # case fans, shown in the FAN group
 
 # Color thresholds: value >= threshold paints that colour. Order matters.
 THRESHOLDS = {
@@ -93,144 +75,33 @@ THRESHOLDS = {
 }
 COLOR_DEFAULT = "#e6e6e6"
 
-# -------- data -----------------------------------------------------------
 
-
-@dataclass
-class DiskReading:
-    label: str
-    temp_c: float | None = None
-    activity_pct: float | None = None
-
-
-@dataclass
-class Sample:
-    cpu_pct: float | None = None
-    cpu_temp_c: float | None = None
-    cpu_power_w: float | None = None
-    cpu_clock_ghz: float | None = None
-    gpu_pct: float | None = None
-    gpu_temp_c: float | None = None
-    gpu_vram_used_gb: float | None = None
-    gpu_vram_total_gb: float | None = None
-    gpu_power_w: float | None = None
-    gpu_fan_rpm: float | None = None
-    gpu_clock_ghz: float | None = None
-    ram_used_gb: float | None = None
-    ram_total_gb: float | None = None
-    disks: list[DiskReading] | None = None
-    aio_rpm: float | None = None
-    case_fans: list[tuple[int, float | None]] | None = None  # [(fan_number, rpm)]
-    net_down_mbps: float | None = None
-    net_up_mbps: float | None = None
-    # Per-display brightness percent, in daemon/Display-Config order.
-    # Entry is None if that display's value is unknown (e.g. DDC unreadable).
-    brightness_pcts: list[int | None] = field(default_factory=list)
-    # Windows Night Light state; None if the registry key is unreadable.
-    nightlight_on: bool | None = None
-    # Default audio output state; each field is None if the query failed.
-    volume_pct: int | None = None
-    volume_muted: bool | None = None
-    audio_device: str | None = None
-
-
-class CpuUtility:
-    """Reads '\\Processor Information(_Total)\\% Processor Utility' via Windows PDH.
-
-    Same underlying counter Task Manager uses on Windows 8+, but reported as a
-    percent of the *base* frequency — so on Turbo it legitimately exceeds 100%
-    (a 12700F at 4.8 GHz against a 2.1 GHz P-core base reads ~180% under load).
-    Task Manager caps display at 100% and shows the turbo factor as "Speed";
-    we keep the raw value so `bar.charts` can show Turbo, and cap the bar's
-    own display in `render()` (the GHz field carries the turbo info there).
-
-    Chosen over psutil.cpu_percent() because psutil maps to '% Processor Time'
-    (time-not-idle), which under-represents work on modern parked-core CPUs.
-    """
-
-    _PDH_FMT_DOUBLE = 0x00000200
-    _COUNTER_PATH   = "\\Processor Information(_Total)\\% Processor Utility"
-
-    class _Value(ctypes.Structure):
-        _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
-
-    def __init__(self) -> None:
-        self._ok = False
-        try:
-            self._pdh = ctypes.WinDLL("pdh.dll")
-            self._query = wintypes.HANDLE()
-            self._counter = wintypes.HANDLE()
-
-            if self._pdh.PdhOpenQueryW(None, 0, ctypes.byref(self._query)) != 0:
-                return
-            if self._pdh.PdhAddEnglishCounterW(
-                self._query, self._COUNTER_PATH, 0, ctypes.byref(self._counter)
-            ) != 0:
-                return
-            # First collect establishes the baseline; first sample() may be 0.
-            self._pdh.PdhCollectQueryData(self._query)
-            self._ok = True
-        except Exception:
-            pass
-
-    def sample(self) -> float | None:
-        if not self._ok:
-            return None
-        try:
-            if self._pdh.PdhCollectQueryData(self._query) != 0:
-                return None
-            val = self._Value()
-            res = self._pdh.PdhGetFormattedCounterValue(
-                self._counter, self._PDH_FMT_DOUBLE, None, ctypes.byref(val)
-            )
-            if res != 0:
-                return None
-            return val.doubleValue
-        except Exception:
-            return None
+# -------- polling --------------------------------------------------------
 
 
 class Poller:
     def __init__(self) -> None:
-        self._nvml_ok = False
-        try:
-            pynvml.nvmlInit()
-            self._gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            self._nvml_ok = True
-        except pynvml.NVMLError:
-            self._gpu_handle = None
-
+        # Created on the worker thread (see PollWorker.start) so backend init
+        # — PDH/NVML on Windows — happens off the GUI thread.
+        self._backend = make_backend()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.monotonic()
-
-        self._cpu_utility = CpuUtility()
-
-        # LHM auto-spawn: set once per Poller lifetime on first unreachable
-        # LHM, so we don't spam schtasks every second.
-        self._lhm_spawn_tried = False
-        self._last_lhm: _LhmReadings | None = None
-        self._last_lhm_at: float | None = None
-        self._last_lhm_failure_log = 0.0
 
     def sample(self) -> Sample:
         s = Sample()
 
-        # cpu %: prefer Processor Utility (matches Task Manager on Win8+),
-        # fall back to psutil's Processor Time if PDH isn't available.
-        s.cpu_pct = self._cpu_utility.sample()
-        if s.cpu_pct is None:
+        # Platform hardware: cpu%, gpu, cpu temp/power, fans, disks.
+        self._backend.populate(s)
+
+        # cpu clock (psutil; None on Apple Silicon) -> GHz. Don't clobber a
+        # value a backend may already have supplied (e.g. macOS powermetrics).
+        if s.cpu_clock_ghz is None:
             try:
-                s.cpu_pct = psutil.cpu_percent(interval=None)
+                freq = psutil.cpu_freq()
+                if freq and freq.current:
+                    s.cpu_clock_ghz = freq.current / 1000.0
             except Exception:
                 pass
-
-        # cpu clock (MHz average across cores) -> GHz
-        try:
-            freq = psutil.cpu_freq()
-            if freq and freq.current:
-                s.cpu_clock_ghz = freq.current / 1000.0
-        except Exception:
-            pass
 
         # ram
         try:
@@ -251,40 +122,13 @@ class Poller:
         except Exception:
             pass
 
-        # initialise disk readings (temp + activity are filled from LHM below)
-        s.disks = [DiskReading(label=spec.label) for spec in DISKS]
-
-        # gpu via nvml
-        if self._nvml_ok:
-            try:
-                util = pynvml.nvmlDeviceGetUtilizationRates(self._gpu_handle)
-                s.gpu_pct = float(util.gpu)
-                s.gpu_temp_c = float(
-                    pynvml.nvmlDeviceGetTemperature(self._gpu_handle, pynvml.NVML_TEMPERATURE_GPU)
-                )
-                meminfo = pynvml.nvmlDeviceGetMemoryInfo(self._gpu_handle)
-                s.gpu_vram_used_gb = meminfo.used / 1024**3
-                s.gpu_vram_total_gb = meminfo.total / 1024**3
-                try:
-                    s.gpu_power_w = pynvml.nvmlDeviceGetPowerUsage(self._gpu_handle) / 1000.0
-                except pynvml.NVMLError:
-                    pass
-                try:
-                    s.gpu_clock_ghz = pynvml.nvmlDeviceGetClockInfo(
-                        self._gpu_handle, pynvml.NVML_CLOCK_GRAPHICS
-                    ) / 1000.0
-                except pynvml.NVMLError:
-                    pass
-            except pynvml.NVMLError:
-                pass
-
         # brightness daemon status — optional, silent if daemon not running
         s.brightness_pcts = _poll_brightness()
 
-        # night light — cheap registry read; None if key absent
+        # blue-light reduction (Windows Night Light / macOS Night Shift)
         s.nightlight_on = nightlight.is_enabled()
 
-        # audio — COM calls are fast; defensive against device transitions
+        # audio — fast; defensive against device transitions
         try:
             status = audio.get_status()
             s.volume_pct = status["volume"]
@@ -293,83 +137,14 @@ class Poller:
         except Exception:
             pass
 
-        # lhm (cpu package temp+power, gpu/case fans, per-disk temp+activity).
-        # One outer tree-walk in `_parse_lhm`, plus a small sub-walk per disk
-        # device — replaces the previous 5+ full walks per tick.
-        try:
-            r = requests.get(LHM_URL, timeout=LHM_TIMEOUT_S)
-            r.raise_for_status()
-            parsed = _parse_lhm(r.json())
-            self._last_lhm = parsed
-            self._last_lhm_at = time.monotonic()
-            self._apply_lhm_readings(s, parsed)
-        except (requests.RequestException, ValueError) as e:
-            if self._apply_cached_lhm_readings(s):
-                self._log_lhm_failure("using cached LHM readings", e)
-            else:
-                self._log_lhm_failure("no cached LHM readings available", e)
-            self._maybe_start_lhm()
-
         return s
-
-    def _apply_lhm_readings(self, sample: Sample, parsed: _LhmReadings) -> None:
-        sample.cpu_temp_c = parsed.cpu_temp_c
-        sample.cpu_power_w = parsed.cpu_power_w
-        sample.gpu_fan_rpm = parsed.gpu_fan_rpm
-        sample.case_fans = [(n, parsed.motherboard_fans.get(n)) for n in CASE_FAN_NUMBERS]
-        if AIO_FAN_NUMBER is not None:
-            sample.aio_rpm = parsed.motherboard_fans.get(AIO_FAN_NUMBER)
-        if sample.disks:
-            _attach_disk_readings(sample.disks, parsed)
-
-    def _apply_cached_lhm_readings(self, sample: Sample) -> bool:
-        if self._last_lhm is None or self._last_lhm_at is None:
-            return False
-        if time.monotonic() - self._last_lhm_at > LHM_CACHE_TTL_S:
-            return False
-        self._apply_lhm_readings(sample, self._last_lhm)
-        return True
-
-    def _log_lhm_failure(self, detail: str, exc: Exception) -> None:
-        now = time.monotonic()
-        if now - self._last_lhm_failure_log < LHM_FAILURE_LOG_INTERVAL_S:
-            return
-        self._last_lhm_failure_log = now
-        log.info("LHM poll failed (%s): %s: %s", detail, type(exc).__name__, exc)
-
-    def _maybe_start_lhm(self) -> None:
-        """Fire the on-demand LHM scheduled task once per Poller lifetime.
-
-        The task is registered (via scripts/install/register-lhm-task.bat)
-        with /RL HIGHEST so `schtasks /Run` launches LHM elevated without a
-        UAC prompt. If the task isn't registered we log once and stop
-        retrying — bar/charts still function, those LHM-fed fields just
-        stay `--` until the user runs the installer.
-        """
-        if self._lhm_spawn_tried:
-            return
-        self._lhm_spawn_tried = True
-        try:
-            result = subprocess.run(
-                ["schtasks.exe", "/Run", "/TN", LHM_TASK_NAME],
-                capture_output=True, text=True, timeout=2.0,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if result.returncode == 0:
-                log.info("LHM unreachable; triggered scheduled task %s", LHM_TASK_NAME)
-            else:
-                log.info("LHM unreachable; schtasks /Run %s failed rc=%d stderr=%s",
-                         LHM_TASK_NAME, result.returncode,
-                         (result.stderr or "").strip())
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log.info("LHM unreachable; schtasks /Run raised: %s", e)
 
 
 # -------- brightness daemon ---------------------------------------------
 
 
 def _poll_brightness() -> list[int | None]:
-    """Query brightness_daemon.py for per-display percent values.
+    """Query the brightness daemon for per-display percent values.
 
     Wire format: 'status' -> '0:40 1:38 2:50' (or '0:- 1:38 ...' for unknown).
     Returns [] if the daemon is unreachable — the bar silently hides the field.
@@ -383,154 +158,6 @@ def _poll_brightness() -> list[int | None]:
         return []
 
     return parse_status(reply)
-
-
-# -------- LHM tree parsing ----------------------------------------------
-
-
-def _walk(node: dict):
-    yield node
-    for child in node.get("Children", []) or []:
-        yield from _walk(child)
-
-
-def _parse_lhm_value(v: str | None) -> float | None:
-    """LHM values look like '62.0 °C' or '18.2 %'. Strip units and parse."""
-    if not v:
-        return None
-    token = v.strip().split()
-    if not token:
-        return None
-    try:
-        return float(token[0].replace(",", "."))
-    except ValueError:
-        return None
-
-
-@dataclass
-class _LhmReadings:
-    cpu_temp_c: float | None = None
-    cpu_power_w: float | None = None
-    gpu_fan_rpm: float | None = None  # averaged across GPU fans
-    motherboard_fans: dict[int, float] = field(default_factory=dict)  # {fan_number: rpm}
-    # Disk readings keyed by (model_string, occurrence_index) — same shape DISKS uses.
-    disks: dict[tuple[str, int], tuple[float | None, float | None]] = field(default_factory=dict)
-
-
-def _parse_lhm(tree: dict) -> _LhmReadings:
-    """Single outer walk extracting every LHM value the bar/charts use.
-
-    Disk sensors are intrinsically scoped to a device's subtree (so the same
-    'Composite Temperature' label can appear in multiple NVMe subtrees), so
-    each disk device kicks off a small sub-walk over its own subtree. That's
-    still one outer walk + N tiny sub-walks instead of the previous 5+ full
-    walks per tick.
-    """
-    r = _LhmReadings()
-    cpu_core_avg: float | None = None       # fallback for cpu_temp_c
-    cpu_power_fallback: float | None = None  # weaker fallback for cpu_power_w
-    gpu_fan_rpms: list[float] = []
-    model_occurrence: dict[str, int] = {}
-
-    for node in _walk(tree):
-        text = (node.get("Text") or "").strip()
-        text_lower = text.lower()
-        ntype = (node.get("Type") or "").lower()
-
-        # Disk device subtree — text contains a DISKS model name and the
-        # subtree exposes temp/activity sensors. Sub-walked here so that
-        # composite/plain temperature lookups don't bleed across devices.
-        for spec in DISKS:
-            if spec.lhm_model in text:
-                temp, activity = _disk_subtree_sensors(node)
-                if temp is None and activity is None:
-                    continue  # text matched, but it's not actually a device node
-                idx = model_occurrence.get(spec.lhm_model, 0)
-                r.disks[(spec.lhm_model, idx)] = (temp, activity)
-                model_occurrence[spec.lhm_model] = idx + 1
-                break
-
-        val = _parse_lhm_value(node.get("Value"))
-        if val is None:
-            continue
-
-        if ntype == "temperature":
-            if text_lower == "cpu package" and r.cpu_temp_c is None:
-                r.cpu_temp_c = val
-            elif text_lower == "core average":
-                cpu_core_avg = val  # remembered as fallback if no Package node
-
-        elif ntype == "power":
-            # "CPU Package" / "Package" — preferred. "CPU Cores [...] Package"
-            # variants (some LHM builds) also count. Parens are explicit on the
-            # last clause because `or X and Y` parses surprisingly otherwise.
-            is_cpu_pkg_pow = (
-                "cpu package" in text_lower
-                or text_lower == "package"
-                or ("cpu cores" in text_lower and "package" in text_lower)
-            )
-            if is_cpu_pkg_pow:
-                if r.cpu_power_w is None:
-                    r.cpu_power_w = val
-            elif "package" in text_lower and cpu_power_fallback is None:
-                cpu_power_fallback = val
-
-        elif ntype == "fan":
-            if text_lower.startswith("gpu fan"):
-                gpu_fan_rpms.append(val)
-            elif text_lower.startswith("fan #"):
-                try:
-                    n = int(text.split("#", 1)[1])
-                    r.motherboard_fans[n] = val
-                except (ValueError, IndexError):
-                    pass
-
-    if r.cpu_temp_c is None:
-        r.cpu_temp_c = cpu_core_avg
-    if r.cpu_power_w is None:
-        r.cpu_power_w = cpu_power_fallback
-    if gpu_fan_rpms:
-        r.gpu_fan_rpm = sum(gpu_fan_rpms) / len(gpu_fan_rpms)
-    return r
-
-
-def _disk_subtree_sensors(device_node: dict) -> tuple[float | None, float | None]:
-    """Return (temp_c, activity_pct) for a single LHM storage-device subtree.
-
-    Temp prefers 'Composite Temperature' (NVMe), falls back to plain
-    'Temperature' (SATA). Activity is the 'Total Activity' Load %.
-    Walks the subtree once.
-    """
-    composite: float | None = None
-    plain: float | None = None
-    activity: float | None = None
-    for node in _walk(device_node):
-        ntype = (node.get("Type") or "").lower()
-        text = (node.get("Text") or "").strip().lower()
-        val = _parse_lhm_value(node.get("Value"))
-        if val is None:
-            continue
-        if ntype == "temperature":
-            if "composite" in text:
-                composite = val
-            elif text == "temperature":
-                plain = val
-        elif ntype == "load" and text == "total activity":
-            activity = val
-    return (composite if composite is not None else plain), activity
-
-
-def _attach_disk_readings(disks: list[DiskReading], parsed: _LhmReadings) -> None:
-    """Copy parsed LHM disk values onto the per-drive readings, respecting
-    the (model, lhm_index) pairing in DISKS — needed when multiple drives
-    share a model name (e.g. two BX500s)."""
-    for reading in disks:
-        spec = next((d for d in DISKS if d.label == reading.label), None)
-        if spec is None:
-            continue
-        pair = parsed.disks.get((spec.lhm_model, spec.lhm_index))
-        if pair is not None:
-            reading.temp_c, reading.activity_pct = pair
 
 
 # -------- ui -------------------------------------------------------------
@@ -574,17 +201,33 @@ def render(s: Sample) -> str:
         _fmt(s.cpu_power_w, "W"),
     ])
 
-    # GPU group
-    gpu_parts = [
-        "GPU",
-        _colored(_fmt(s.gpu_pct, "%"), _color_for("gpu_pct", s.gpu_pct)),
-    ]
-    if s.gpu_clock_ghz is not None:
-        gpu_parts.append(f"{s.gpu_clock_ghz:.1f}G")
-    gpu_parts.append(_colored(_fmt(s.gpu_temp_c, "°C"), _color_for("gpu_temp_c", s.gpu_temp_c)))
-    if s.gpu_vram_used_gb is not None and s.gpu_vram_total_gb is not None:
-        gpu_parts.append(f"{s.gpu_vram_used_gb:.1f}/{s.gpu_vram_total_gb:.0f}G")
-    gpu_parts.append(_fmt(s.gpu_power_w, "W"))
+    # GPU group. Apple Silicon is a unified SoC: no dedicated VRAM, and the GPU
+    # shares the CPU's die (so a "GPU temp" just duplicates the CPU temp). On
+    # macOS we therefore show only the meaningful signals — load% and power —
+    # and hide the group entirely when there's no GPU data (e.g. the
+    # powermetrics daemon isn't installed). Windows keeps the discrete GPU's
+    # full readout (load, clock, temp, VRAM, power).
+    gpu_sections: list[str] = []
+    if IS_MACOS:
+        if s.gpu_pct is not None or s.gpu_power_w is not None:
+            gpu_parts = ["GPU"]
+            if s.gpu_pct is not None:
+                gpu_parts.append(_colored(_fmt(s.gpu_pct, "%"), _color_for("gpu_pct", s.gpu_pct)))
+            if s.gpu_power_w is not None:
+                gpu_parts.append(_fmt(s.gpu_power_w, "W"))
+            gpu_sections.append(" ".join(gpu_parts))
+    else:
+        gpu_parts = [
+            "GPU",
+            _colored(_fmt(s.gpu_pct, "%"), _color_for("gpu_pct", s.gpu_pct)),
+        ]
+        if s.gpu_clock_ghz is not None:
+            gpu_parts.append(f"{s.gpu_clock_ghz:.1f}G")
+        gpu_parts.append(_colored(_fmt(s.gpu_temp_c, "°C"), _color_for("gpu_temp_c", s.gpu_temp_c)))
+        if s.gpu_vram_used_gb is not None and s.gpu_vram_total_gb is not None:
+            gpu_parts.append(f"{s.gpu_vram_used_gb:.1f}/{s.gpu_vram_total_gb:.0f}G")
+        gpu_parts.append(_fmt(s.gpu_power_w, "W"))
+        gpu_sections.append(" ".join(gpu_parts))
 
     # RAM
     if s.ram_used_gb is not None and s.ram_total_gb is not None:
@@ -619,7 +262,7 @@ def render(s: Sample) -> str:
                 for i in order]
         bri_sections.append("BRI " + " ".join(vals))
 
-    # Night Light — warm colour when on to echo the actual tint
+    # Night Light / Night Shift — warm colour when on to echo the actual tint
     nl_sections: list[str] = []
     if s.nightlight_on is not None:
         if s.nightlight_on:
@@ -656,7 +299,7 @@ def render(s: Sample) -> str:
     # Order: CPU, GPU, RAM, NET, BRI, NL, VOL, OUT, AIO, FAN, GPU-FAN, disks
     sections = [
         " ".join(cpu_parts),
-        " ".join(gpu_parts),
+        *gpu_sections,
         ram,
         net,
         *bri_sections,
@@ -685,7 +328,7 @@ class PollWorker(QObject):
 
     @pyqtSlot()
     def start(self) -> None:
-        self._poller = Poller()  # init NVML/PDH on the worker thread
+        self._poller = Poller()  # init backend (NVML/PDH) on the worker thread
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.start(REFRESH_MS)
@@ -705,14 +348,25 @@ class PollWorker(QObject):
 class Bar(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowFlags(
+        # Qt.Tool keeps the bar out of the Windows taskbar, but on macOS a Tool
+        # window is a utility panel that auto-hides whenever its app isn't
+        # frontmost — useless for an always-on widget. So drop Tool on macOS
+        # and instead make the app a background "accessory" (no Dock icon, no
+        # menu bar, doesn't deactivate the widget) via _macos_accessory_mode().
+        flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool  # no taskbar entry
         )
+        if not IS_MACOS:
+            flags |= Qt.WindowType.Tool  # no taskbar entry (Windows)
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         self._drag_offset: QPoint | None = None
+        # While True, keep the bar pinned flush to the top-right corner as its
+        # width changes (content/platform-dependent). Cleared once the user
+        # drags it somewhere, or if a saved position is loaded.
+        self._auto_position = True
 
         self.label = QLabel("initializing…")
         self.label.setTextFormat(Qt.TextFormat.RichText)
@@ -720,7 +374,9 @@ class Bar(QWidget):
         # so drag (press/move/release) reaches the parent Bar widget.
         self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         font_family = (
-            "Cascadia Mono" if "Cascadia Mono" in QFontDatabase.families() else "Consolas"
+            "Cascadia Mono" if "Cascadia Mono" in QFontDatabase.families()
+            else "Menlo" if "Menlo" in QFontDatabase.families()
+            else "Consolas"
         )
         self.label.setFont(QFont(font_family, 10))
         self.label.setStyleSheet(
@@ -746,7 +402,25 @@ class Bar(QWidget):
 
     def _on_sample(self, sample: Sample) -> None:
         self.label.setText(render(sample))
-        self.adjustSize()
+        self.adjustSize()  # triggers resizeEvent -> re-pin if auto-positioning
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # resizeEvent fires after the new geometry is applied, so width() is
+        # reliable here (unlike frameGeometry() right after show()).
+        if self._auto_position:
+            self._pin_top_right()
+
+    def _pin_top_right(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        x = max(area.left(), area.right() - self.width() - 5)
+        log.debug("pin: area=(%d,%d,%d,%d) width=%d -> move(%d,%d)",
+                  area.x(), area.y(), area.width(), area.height(),
+                  self.width(), x, area.top() + 8)
+        self.move(x, area.top() + 8)
 
     def shutdown(self) -> None:
         """Stop the worker's timer and join its thread before the app exits."""
@@ -767,6 +441,7 @@ class Bar(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         self._drag_offset = None
+        self._auto_position = False  # user chose a spot; stop auto-pinning
         self._save_position()
 
     # -- right-click exit --
@@ -782,8 +457,16 @@ class Bar(QWidget):
         save_window_pos(CONFIG_FILE, self)
 
     def _load_position(self) -> None:
-        screen = QApplication.primaryScreen().availableGeometry()
-        load_window_pos(CONFIG_FILE, self, (screen.right() - 620, screen.top() + 8))
+        # A saved position wins and disables auto-pinning; otherwise default to
+        # the top-right corner and keep it pinned there as the width settles.
+        if CONFIG_FILE.exists():
+            self._auto_position = False
+            screen = QApplication.primaryScreen().availableGeometry()
+            load_window_pos(CONFIG_FILE, self, (screen.right() - 620, screen.top() + 8))
+        else:
+            self._auto_position = True
+            self.adjustSize()
+            self._pin_top_right()
 
 
 def main() -> int:
@@ -791,6 +474,10 @@ def main() -> int:
     log.info("launch argv=%s log=%s", sys.argv[1:], log_path)
 
     app = QApplication(sys.argv)
+    if IS_MACOS:
+        from bar.macwin import accessory_mode
+        accessory_mode()  # no Dock icon; don't deactivate the widget on focus loss
+
     single = SingleInstance("hardware-bar", log)
     if single.signal_existing():
         return 0
@@ -799,6 +486,9 @@ def main() -> int:
     single.become_primary(bar.close)
     app.aboutToQuit.connect(bar.shutdown)
     bar.show()
+    if IS_MACOS:
+        from bar.macwin import float_on_all_spaces
+        float_on_all_spaces(bar)  # status level, visible across Spaces
     return app.exec()
 
 

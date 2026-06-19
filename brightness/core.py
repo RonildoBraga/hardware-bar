@@ -1,384 +1,81 @@
-"""brightness.py — adjust per-monitor brightness.
+"""brightness — adjust per-monitor brightness (Windows + macOS).
 
-Uses DDC/CI (via monitorcontrol) on SDR displays, and Windows'
-DisplayConfigSetDeviceInfo / SDRWhiteLevel API on displays that currently have
-HDR enabled (where DDC/CI brightness is typically ignored by the firmware).
+Platform dispatcher. The bar, the daemon (`from . import core as br`), and the
+offline CLI all talk to this module; it forwards to the active backend:
+
+    Windows: DDC/CI + HDR SDRWhiteLevel via DisplayConfig (`_win.py`)
+    macOS:   `brightness` CLI (built-in) + `m1ddc` (external)  (`_mac.py`)
+
+Both backends expose the same names — DisplayTarget, build_display_index,
+is_hdr_enabled, get/set_sdr_white_level, compute_hdr_adjust, list_displays,
+adjust — and return monitor objects with a `with m: m.get_luminance()/
+set_luminance()` protocol, so brightness/daemon.py is platform-agnostic.
+
+The percent<->SDR-white-level math (`_scale.py`) is re-exported here because
+tests/test_brightness.py imports it from brightness.core.
 
 Usage:
-    brightness.py --list                  # show all displays and current state
-    brightness.py <index> <delta>         # change brightness by signed delta, 0-100 scale
-
-Examples:
-    brightness.py 0 +5
-    brightness.py 1 -10
+    brightness --list                  # show all displays and current state
+    brightness <index> <delta>         # change brightness by signed delta
 """
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import sys
-from ctypes import wintypes
 from pathlib import Path
-from typing import NamedTuple, Optional
 
-from monitorcontrol import get_monitors, Monitor, VCPError
-
-# Ensure project root on sys.path for the _common import when launched as
-# `pythonw.exe C:\...\brightness\core.py` directly (no working-dir).
 if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from _common import setup_logging
+from _common import IS_MACOS, IS_WINDOWS, setup_logging
+
+# Re-exported for tests/test_brightness.py and for the daemon's HDR math.
+from ._scale import (  # noqa: F401
+    SDR_WL_MAX,
+    SDR_WL_MIN,
+    HdrAdjust,
+    sdr_pct_to_wl,
+    sdr_wl_to_pct,
+)
 
 log = logging.getLogger("brightness")
 
-# -------- Win32 DisplayConfig API via ctypes -----------------------------
+if IS_WINDOWS:
+    from ._win import (  # noqa: F401
+        DisplayTarget,
+        adjust,
+        build_display_index,
+        compute_hdr_adjust,
+        get_sdr_white_level,
+        is_hdr_enabled,
+        list_displays,
+        set_sdr_white_level,
+    )
+elif IS_MACOS:
+    from ._mac import (  # noqa: F401
+        DisplayTarget,
+        adjust,
+        build_display_index,
+        compute_hdr_adjust,
+        get_sdr_white_level,
+        is_hdr_enabled,
+        list_displays,
+        set_sdr_white_level,
+    )
+else:
+    DisplayTarget = None  # type: ignore
 
-user32 = ctypes.WinDLL("user32")
-
-QDC_ONLY_ACTIVE_PATHS = 0x00000002
-
-# DISPLAYCONFIG_DEVICE_INFO_TYPE values
-GET_TARGET_NAME                = 2
-GET_ADVANCED_COLOR_INFO        = 9
-GET_SDR_WHITE_LEVEL            = 11
-# The "set SDR white level" type is not publicly documented; community-known
-# value that Microsoft's internal tools use:
-SET_SDR_WHITE_LEVEL            = -18  # signed; == 0xFFFFFFEE as unsigned
-
-
-class LUID(ctypes.Structure):
-    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
-
-
-class DISPLAYCONFIG_DEVICE_INFO_HEADER(ctypes.Structure):
-    _fields_ = [
-        ("type",       ctypes.c_int32),
-        ("size",       wintypes.UINT),
-        ("adapterId",  LUID),
-        ("id",         wintypes.UINT),
-    ]
-
-
-class DISPLAYCONFIG_RATIONAL(ctypes.Structure):
-    _fields_ = [("Numerator", wintypes.UINT), ("Denominator", wintypes.UINT)]
-
-
-class DISPLAYCONFIG_PATH_SOURCE_INFO(ctypes.Structure):
-    _fields_ = [
-        ("adapterId",   LUID),
-        ("id",          wintypes.UINT),
-        ("modeInfoIdx", wintypes.UINT),
-        ("statusFlags", wintypes.UINT),
-    ]
-
-
-class DISPLAYCONFIG_PATH_TARGET_INFO(ctypes.Structure):
-    _fields_ = [
-        ("adapterId",        LUID),
-        ("id",               wintypes.UINT),
-        ("modeInfoIdx",      wintypes.UINT),
-        ("outputTechnology", wintypes.UINT),
-        ("rotation",         wintypes.UINT),
-        ("scaling",          wintypes.UINT),
-        ("refreshRate",      DISPLAYCONFIG_RATIONAL),
-        ("scanLineOrdering", wintypes.UINT),
-        ("targetAvailable",  wintypes.BOOL),
-        ("statusFlags",      wintypes.UINT),
-    ]
-
-
-class DISPLAYCONFIG_PATH_INFO(ctypes.Structure):
-    _fields_ = [
-        ("sourceInfo", DISPLAYCONFIG_PATH_SOURCE_INFO),
-        ("targetInfo", DISPLAYCONFIG_PATH_TARGET_INFO),
-        ("flags",      wintypes.UINT),
-    ]
-
-
-class DISPLAYCONFIG_TARGET_DEVICE_NAME(ctypes.Structure):
-    _fields_ = [
-        ("header",                    DISPLAYCONFIG_DEVICE_INFO_HEADER),
-        ("flags",                     wintypes.UINT),
-        ("outputTechnology",          wintypes.UINT),
-        ("edidManufactureId",         wintypes.USHORT),
-        ("edidProductCodeId",         wintypes.USHORT),
-        ("connectorInstance",         wintypes.UINT),
-        ("monitorFriendlyDeviceName", ctypes.c_wchar * 64),
-        ("monitorDevicePath",         ctypes.c_wchar * 128),
-    ]
-
-
-class DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO(ctypes.Structure):
-    _fields_ = [
-        ("header",              DISPLAYCONFIG_DEVICE_INFO_HEADER),
-        ("value",               wintypes.UINT),
-        ("colorEncoding",       wintypes.UINT),
-        ("bitsPerColorChannel", wintypes.UINT),
-    ]
-
-
-class DISPLAYCONFIG_SDR_WHITE_LEVEL(ctypes.Structure):
-    _fields_ = [
-        ("header",        DISPLAYCONFIG_DEVICE_INFO_HEADER),
-        ("SDRWhiteLevel", wintypes.ULONG),
-    ]
-
-
-class DISPLAYCONFIG_SET_SDR_WHITE_LEVEL(ctypes.Structure):
-    """Undocumented. 'finalValue=1' tells Windows this is the committed value."""
-    _fields_ = [
-        ("header",        DISPLAYCONFIG_DEVICE_INFO_HEADER),
-        ("SDRWhiteLevel", wintypes.ULONG),
-        ("finalValue",    wintypes.BYTE),
-    ]
-
-
-# Function prototypes
-user32.GetDisplayConfigBufferSizes.argtypes = [
-    wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT),
-]
-user32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
-
-user32.QueryDisplayConfig.argtypes = [
-    wintypes.UINT,
-    ctypes.POINTER(wintypes.UINT), ctypes.c_void_p,
-    ctypes.POINTER(wintypes.UINT), ctypes.c_void_p,
-    ctypes.c_void_p,
-]
-user32.QueryDisplayConfig.restype = wintypes.LONG
-
-user32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
-user32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
-
-user32.DisplayConfigSetDeviceInfo.argtypes = [ctypes.c_void_p]
-user32.DisplayConfigSetDeviceInfo.restype = wintypes.LONG
-
-
-# -------- DisplayConfig high-level helpers -------------------------------
-
-
-class DisplayTarget(NamedTuple):
-    name:       str
-    adapterId:  LUID
-    targetId:   int
-
-
-def enumerate_display_targets() -> list[DisplayTarget]:
-    n_paths = wintypes.UINT(0)
-    n_modes = wintypes.UINT(0)
-    if user32.GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
-                                          ctypes.byref(n_paths),
-                                          ctypes.byref(n_modes)) != 0:
+    def build_display_index():  # type: ignore
         return []
 
-    paths = (DISPLAYCONFIG_PATH_INFO * n_paths.value)()
-    # Mode buffer: we allocate as raw bytes since we don't use modes here.
-    mode_size = 64  # DISPLAYCONFIG_MODE_INFO struct is 64 bytes
-    modes = (ctypes.c_byte * (mode_size * n_modes.value))()
-
-    if user32.QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
-                                 ctypes.byref(n_paths), paths,
-                                 ctypes.byref(n_modes), modes,
-                                 None) != 0:
-        return []
-
-    out: list[DisplayTarget] = []
-    for i in range(n_paths.value):
-        tinfo = paths[i].targetInfo
-        name_struct = DISPLAYCONFIG_TARGET_DEVICE_NAME()
-        name_struct.header.type      = GET_TARGET_NAME
-        name_struct.header.size      = ctypes.sizeof(name_struct)
-        name_struct.header.adapterId = tinfo.adapterId
-        name_struct.header.id        = tinfo.id
-        if user32.DisplayConfigGetDeviceInfo(ctypes.byref(name_struct)) == 0:
-            friendly = name_struct.monitorFriendlyDeviceName.strip()
-        else:
-            friendly = f"Display {i}"
-        out.append(DisplayTarget(friendly, tinfo.adapterId, tinfo.id))
-    return out
-
-
-def is_hdr_enabled(target: DisplayTarget) -> bool:
-    info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO()
-    info.header.type      = GET_ADVANCED_COLOR_INFO
-    info.header.size      = ctypes.sizeof(info)
-    info.header.adapterId = target.adapterId
-    info.header.id        = target.targetId
-    if user32.DisplayConfigGetDeviceInfo(ctypes.byref(info)) != 0:
-        return False
-    return bool(info.value & 0x2)  # bit 1 = advancedColorEnabled
-
-
-def get_sdr_white_level(target: DisplayTarget) -> int:
-    """Return current SDR white level (units of 1/1000 * 80 nits; default 1000)."""
-    info = DISPLAYCONFIG_SDR_WHITE_LEVEL()
-    info.header.type      = GET_SDR_WHITE_LEVEL
-    info.header.size      = ctypes.sizeof(info)
-    info.header.adapterId = target.adapterId
-    info.header.id        = target.targetId
-    if user32.DisplayConfigGetDeviceInfo(ctypes.byref(info)) != 0:
-        return 1000
-    return info.SDRWhiteLevel or 1000
-
-
-def set_sdr_white_level(target: DisplayTarget, level: int) -> bool:
-    info = DISPLAYCONFIG_SET_SDR_WHITE_LEVEL()
-    info.header.type      = SET_SDR_WHITE_LEVEL
-    info.header.size      = ctypes.sizeof(info)
-    info.header.adapterId = target.adapterId
-    info.header.id        = target.targetId
-    info.SDRWhiteLevel    = max(1000, min(6250, level))
-    info.finalValue       = 1
-    return user32.DisplayConfigSetDeviceInfo(ctypes.byref(info)) == 0
-
-
-# -------- Mapping monitorcontrol index <-> DisplayTarget -----------------
-
-# SDR white level values roughly map 1000 (80 nits) -> 6250 (500 nits).
-# Expose a 0..100 "percent" to users and linearly convert.
-SDR_WL_MIN = 1000
-SDR_WL_MAX = 6250
-
-
-def sdr_pct_to_wl(pct: int) -> int:
-    pct = max(0, min(100, pct))
-    return int(SDR_WL_MIN + (SDR_WL_MAX - SDR_WL_MIN) * pct / 100)
-
-
-def sdr_wl_to_pct(wl: int) -> int:
-    return int(round((wl - SDR_WL_MIN) / (SDR_WL_MAX - SDR_WL_MIN) * 100))
-
-
-class HdrAdjust(NamedTuple):
-    cur_wl: int
-    new_wl: int
-    cur_pct: int
-    new_pct: int
-
-
-def compute_hdr_adjust(target: DisplayTarget, delta: int) -> HdrAdjust:
-    """Read the current HDR SDR-white-level for `target` and compute where a
-    signed `delta` (in percent) lands. Shared by the offline CLI (core.adjust)
-    and the daemon so the clamp + percent<->white-level mapping lives once."""
-    cur_wl = get_sdr_white_level(target)
-    cur_pct = sdr_wl_to_pct(cur_wl)
-    new_pct = max(0, min(100, cur_pct + delta))
-    new_wl = sdr_pct_to_wl(new_pct)
-    return HdrAdjust(cur_wl, new_wl, cur_pct, new_pct)
-
-
-def _monitor_name(m: Monitor) -> str:
-    """Best-effort model name from monitorcontrol. Returns '' if unavailable."""
-    try:
-        with m:
-            caps = m.get_vcp_capabilities()
-            if isinstance(caps, dict):
-                return (caps.get("model") or "").strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _norm(s: str) -> str:
-    return "".join(c for c in s.lower() if c.isalnum())
-
-
-def build_display_index() -> list[tuple[DisplayTarget, Optional[Monitor]]]:
-    """Return (DisplayTarget, monitorcontrol.Monitor|None) for each active
-    display, in DisplayConfig (= Windows Display 1/2/3) order.
-
-    Matching strategy:
-     1. Name match — if monitorcontrol reports a model string that overlaps
-        the DisplayConfig friendly name (e.g. both say 'Cintiq 16').
-     2. Positional fill — leftover DisplayConfig targets get paired with
-        leftover monitorcontrol entries in order. Works because both APIs
-        usually enumerate adapters/outputs in the same sequence.
-    """
-    targets = enumerate_display_targets()
-    monitors = get_monitors()
-    mc_names = [(_norm(_monitor_name(m)), m) for m in monitors]
-    used_mc: set[int] = set()
-    results: list[tuple[DisplayTarget, Optional[Monitor]]] = [(t, None) for t in targets]
-
-    # Pass 1: name match
-    for ti, t in enumerate(targets):
-        tname = _norm(t.name)
-        for mi, (mcname, m) in enumerate(mc_names):
-            if mi in used_mc:
-                continue
-            if mcname and (mcname in tname or tname in mcname):
-                results[ti] = (t, m)
-                used_mc.add(mi)
-                break
-
-    # Pass 2: positional fill for unmatched targets
-    leftover_mc = [i for i in range(len(mc_names)) if i not in used_mc]
-    for ti, (t, m) in enumerate(results):
-        if m is None and leftover_mc:
-            mi = leftover_mc.pop(0)
-            results[ti] = (t, mc_names[mi][1])
-            used_mc.add(mi)
-
-    return results
-
-
-# -------- Public operations ---------------------------------------------
-
-
-def list_displays() -> int:
-    rows = build_display_index()
-    print(f"Found {len(rows)} display(s) (indexed in Windows display order):\n")
-    for i, (t, m) in enumerate(rows):
-        hdr = is_hdr_enabled(t)
-        print(f"[{i}] {t.name}   HDR={'ON' if hdr else 'off'}")
-        if m is not None:
-            try:
-                with m:
-                    b = m.get_luminance()
-                    print(f"     DDC/CI brightness: {b}")
-            except VCPError as e:
-                print(f"     DDC/CI: not available ({e})")
-        else:
-            print("     DDC/CI: no matching monitorcontrol entry")
-        if hdr:
-            wl = get_sdr_white_level(t)
-            print(f"     SDR white level: {wl}  (~{sdr_wl_to_pct(wl)}% on 0-100 scale)")
-    return 0
-
-
-def adjust(index: int, delta: int) -> int:
-    rows = build_display_index()
-    if index < 0 or index >= len(rows):
-        log.error("invalid display index %d (valid: 0..%d)", index, len(rows) - 1)
+    def list_displays() -> int:  # type: ignore
+        print(f"brightness: unsupported platform {sys.platform}")
         return 2
-    target, m = rows[index]
-    hdr_on = is_hdr_enabled(target)
-    log.info("adjust: index=%d display=%s hdr=%s delta=%+d",
-             index, target.name, hdr_on, delta)
 
-    if hdr_on:
-        adj = compute_hdr_adjust(target, delta)
-        ok = set_sdr_white_level(target, adj.new_wl)
-        log.info("  HDR path: sdr_wl %d -> %d (%d%% -> %d%%)  result=%s",
-                 adj.cur_wl, adj.new_wl, adj.cur_pct, adj.new_pct, "ok" if ok else "FAILED")
-        return 0 if ok else 1
-
-    # SDR path: DDC/CI
-    if m is None:
-        log.error("  SDR path: no DDC/CI device available for this display")
-        return 1
-    try:
-        with m:
-            cur = m.get_luminance()
-            new = max(0, min(100, cur + delta))
-            m.set_luminance(new)
-            log.info("  SDR path: DDC/CI brightness %d -> %d", cur, new)
-            return 0
-    except VCPError as e:
-        log.error("  SDR path: DDC/CI error: %s", e)
-        return 1
+    def adjust(index: int, delta: int) -> int:  # type: ignore
+        print(f"brightness: unsupported platform {sys.platform}")
+        return 2
 
 
 def main() -> int:
@@ -392,7 +89,7 @@ def main() -> int:
     if args[0] == "--list":
         return list_displays()
     if len(args) != 2:
-        print("Usage: brightness.py <index> <delta>  |  brightness.py --list")
+        print("Usage: brightness <index> <delta>  |  brightness --list")
         return 2
     try:
         return adjust(int(args[0]), int(args[1]))

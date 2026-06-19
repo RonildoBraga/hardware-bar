@@ -1,9 +1,19 @@
+# Cross-platform core (bar UI, charts, sensors, discovery, smart plugs)
 PyQt6>=6.7
-psutil>=5.9
-nvidia-ml-py>=12.535
-requests>=2.31
 pyqtgraph>=0.13
-monitorcontrol>=4.2
-pycaw>=20240210
+psutil>=5.9
+requests>=2.31
 zeroconf>=0.130
 meross_iot>=0.4
+
+# Windows-only hardware + control backends
+nvidia-ml-py>=12.535 ; sys_platform == "win32"
+monitorcontrol>=4.2  ; sys_platform == "win32"
+pycaw>=20240210      ; sys_platform == "win32"
+comtypes>=1.2        ; sys_platform == "win32"
+
+# macOS-only window/app integration (accessory mode, all-Spaces floating).
+# Volume/brightness/Night Shift/output-switching shell out to system + Homebrew
+# tools (osascript, m1ddc, brightness, nightlight, SwitchAudioSource) — see README.
+pyobjc-core>=10            ; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10 ; sys_platform == "darwin"

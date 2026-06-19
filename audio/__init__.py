@@ -1,4 +1,4 @@
-"""Windows audio control — volume, mute, default output device cycling."""
+"""Audio control — volume, mute, default output device cycling (Windows + macOS)."""
 
 from .core import (
     OutputDevice,

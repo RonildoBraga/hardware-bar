@@ -30,7 +30,7 @@ from typing import Callable
 
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QPoint
-from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QFont, QFontDatabase, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QVBoxLayout, QWidget
 
 # Allow direct-file invocation (e.g. `pythonw.exe C:\...\bar\charts.py cpu`)
@@ -39,7 +39,7 @@ if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from _common import (
-    SingleInstance, colored as _colored, fmt as _fmt, load_window_pos,
+    IS_MACOS, SingleInstance, colored as _colored, fmt as _fmt, load_window_pos,
     read_published_sample, save_window_pos, setup_logging,
 )
 from bar.main import DiskReading, Sample
@@ -261,6 +261,49 @@ METRICS: dict[str, MetricSpec] = {
 }
 
 
+# -------- macOS metric adaptation --------------------------------------
+
+def _h_temps_mac(s: Sample) -> str:
+    parts = [_colored(f"CPU {_fmt(s.cpu_temp_c, '°C')}", "#ff6b6b")]
+    for r in s.disks or []:
+        parts.append(_colored(f"{r.label} {_fmt(r.temp_c, '°C')}", "#57d787"))
+    return "&nbsp;".join(parts)
+
+
+def _adapt_metrics_for_macos() -> None:
+    """Retune the Windows-tuned METRICS for Apple Silicon: psutil CPU% maxes at
+    100 (no Turbo >100), the RAM range comes from the actual installed total,
+    there's no discrete GPU temperature (unified SoC die), and storage is a
+    single internal SSD (no per-drive activity, no C/D/E/F)."""
+    import psutil
+    METRICS["cpu"].y_range = (0, 100)
+    METRICS["cpu-gpu"].y_range = (0, 100)
+    try:
+        total_gb = max(1, round(psutil.virtual_memory().total / 1024**3))
+        METRICS["ram"].y_range = (0, total_gb)
+    except Exception:
+        pass
+    METRICS.pop("gpu-temp", None)   # no separate GPU temp on a unified die
+    METRICS.pop("disk", None)       # disk activity % isn't exposed on macOS
+    METRICS["disk-temps"] = MetricSpec(
+        title="SSD temperature", y_label="°C", y_range=(20, 80),
+        series=[_disk_temp_series("SSD", 0, "#4ea1ff")],
+        header_fn=_h_disk_temps,
+    )
+    METRICS["temps"] = MetricSpec(
+        title="All temperatures", y_label="°C", y_range=(20, 100),
+        series=[
+            ("CPU", "#ff6b6b", lambda s: s.cpu_temp_c),
+            _disk_temp_series("SSD", 0, "#57d787"),
+        ],
+        header_fn=_h_temps_mac,
+    )
+
+
+if IS_MACOS:
+    _adapt_metrics_for_macos()
+
+
 class ChartWindow(QWidget):
     def __init__(self, metric_key: str, spec: MetricSpec) -> None:
         super().__init__()
@@ -268,18 +311,28 @@ class ChartWindow(QWidget):
         self._spec = spec
         self._drag_offset: QPoint | None = None
 
-        self.setWindowFlags(
+        # Qt.Tool keeps charts off the Windows taskbar, but on macOS a Tool
+        # window self-hides when its app isn't frontmost (see bar/main.py); drop
+        # it there and use accessory mode + all-Spaces floating in main().
+        flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
         )
+        if not IS_MACOS:
+            flags |= Qt.WindowType.Tool
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.resize(WINDOW_W, WINDOW_H)
 
         # Title label (top bar). Doubles as live header when spec.header_fn is set.
         self.title_label = QLabel(spec.title)
         self.title_label.setTextFormat(Qt.TextFormat.RichText)
-        self.title_label.setFont(QFont("Cascadia Mono", 9))
+        chart_font = (
+            "Cascadia Mono" if "Cascadia Mono" in QFontDatabase.families()
+            else "Menlo" if "Menlo" in QFontDatabase.families()
+            else "Consolas"
+        )
+        self.title_label.setFont(QFont(chart_font, 9))
         self.title_label.setStyleSheet(
             f"color: {TEXT}; padding: 4px 8px 0 10px; background: transparent;"
         )
@@ -382,6 +435,20 @@ class ChartWindow(QWidget):
         screen = QApplication.primaryScreen().availableGeometry()
         load_window_pos(self._config_file(), self,
                         (screen.center().x() - WINDOW_W // 2, screen.top() + 60))
+        if IS_MACOS:
+            self._clamp_into_screen()
+
+    def _clamp_into_screen(self) -> None:
+        """Pull a stale/off-screen saved position back on-screen. Chart windows
+        are a fixed size, so the geometry here is reliable (unlike the bar)."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        x = min(max(self.x(), area.left()), max(area.left(), area.right() - WINDOW_W))
+        y = min(max(self.y(), area.top()), max(area.top(), area.bottom() - WINDOW_H))
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
 
 
 def main() -> int:
@@ -395,6 +462,9 @@ def main() -> int:
 
     metric = sys.argv[1]
     app = QApplication(sys.argv)
+    if IS_MACOS:
+        from bar.macwin import accessory_mode
+        accessory_mode()  # no Dock icon; don't deactivate the window on focus loss
 
     # Toggle: if another instance for this metric is running, tell it to close
     # and exit this one silently.
@@ -405,6 +475,9 @@ def main() -> int:
     win = ChartWindow(metric, METRICS[metric])
     single.become_primary(win.close)
     win.show()
+    if IS_MACOS:
+        from bar.macwin import float_on_all_spaces
+        float_on_all_spaces(win)  # status level, visible across Spaces
     return app.exec()
 
 

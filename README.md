@@ -1,10 +1,36 @@
 # hardware-bar
 
-Minimalist always-on-top desktop bar showing CPU/GPU/RAM/SSD/network/brightness live for
-this machine (i7-12700F / RTX 3080 / Crucial T500), plus per-monitor brightness control
-and Windows Night Light toggle — all designed to be driven from a Loupedeck CT.
+Minimalist always-on-top desktop bar showing CPU/GPU/RAM/SSD/network/brightness live,
+plus per-monitor brightness control, blue-light-reduction toggle, audio control, and
+smart-plug control — all designed to be driven from a Loupedeck CT.
 
-## First-time setup
+Runs on **Windows** (i7-12700F / RTX 3080 / Crucial T500) and **macOS** (Apple Silicon)
+from a single, shared codebase. Each OS-specific capability has a platform backend
+selected at runtime via `sys.platform`; anything a backend can't supply on a given
+machine renders as `--` (or is hidden) rather than failing.
+
+## Platform support
+
+| Capability                        | Windows                                   | macOS (Apple Silicon)                                  |
+|-----------------------------------|-------------------------------------------|--------------------------------------------------------|
+| CPU % · clock · RAM · network     | psutil + PDH Processor Utility            | psutil                                                 |
+| Volume · mute                     | pycaw (IAudioEndpointVolume)              | `osascript` (always available)                         |
+| Audio output switching            | IPolicyConfig COM                         | `SwitchAudioSource` (brew)                             |
+| Blue-light toggle                 | Night Light (registry blob)               | Night Shift (`nightlight` CLI, brew)                   |
+| External display brightness       | DDC/CI (monitorcontrol) + HDR SDRWhiteLevel | `m1ddc` (brew)                                        |
+| Built-in display brightness       | n/a                                       | DisplayServices (private framework, ctypes — no install) |
+| CPU/SSD temperature               | LibreHardwareMonitor HTTP                 | IOKit IOHID sensors (ctypes — **no sudo**)             |
+| Fan RPM                           | LibreHardwareMonitor HTTP                 | AppleSMC IOConnect (ctypes — **no sudo**)              |
+| GPU load · CPU/GPU power          | pynvml + LibreHardwareMonitor             | `powermetrics` privileged daemon (one-time sudo install) |
+| Smart plugs (Meross) · LAN scan   | cloud / mDNS+SSDP (cross-platform)        | same                                                   |
+
+The architecture: each capability module exposes a stable public API and dispatches to a
+`_win.py` / `_mac.py` backend. The bar's hardware sensors sit behind `bar/sensors.py`
+(`WindowsBackend` / `MacBackend`). Pure logic that the tests pin — the LHM JSON parser
+(`bar/model.py`), the Night Light blob codec (`nightlight/_blob.py`), and the SDR
+white-level math (`brightness/_scale.py`) — is platform-free and runs everywhere.
+
+## First-time setup — Windows
 
 ```
 cd C:\Users\ronildo\Developer\hardware-bar
@@ -12,7 +38,86 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-## LibreHardwareMonitor (CPU + SSD temps, CPU power, fan tachos)
+## First-time setup — macOS
+
+Use Python 3.13 (3.14 has no PyQt6 wheels yet):
+
+```
+cd ~/Developer/mac-bar
+python3.13 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+`requirements.txt` uses environment markers, so `pip` installs only the relevant
+backends per OS (pycaw/monitorcontrol/nvidia-ml-py on Windows; PyObjC on macOS).
+
+Optional Homebrew tools — install only the features you want; each degrades to `--`
+or a hidden field if its tool is absent:
+
+```
+brew install m1ddc                  # external-display brightness (DDC)
+brew install switchaudio-osx        # audio output-device cycling
+brew install smudge/smudge/nightlight   # Night Shift toggle
+```
+
+Built-in-display brightness, CPU/SSD temperature, and fan RPM need **no** install —
+they're read directly via system frameworks. GPU load and CPU/GPU power need the
+optional privileged sampler (see *GPU load & power on macOS* below).
+
+Run it:
+
+```
+.venv/bin/python -m bar          # or: scripts/launchers/mac/run.command
+```
+
+## GPU load & power on macOS (optional, needs sudo once)
+
+macOS gates GPU activity and package power behind root (`powermetrics`). Rather than run
+the GUI as root, a tiny stdlib-only sampler runs as root via a LaunchDaemon and writes
+samples to `/tmp/hardware-bar-powermetrics.json`, which the user-level bar reads — the
+same privileged-service pattern LibreHardwareMonitor uses on Windows.
+
+```
+sudo ./scripts/install/install-powermetrics-daemon.sh        # install + start
+sudo ./scripts/install/install-powermetrics-daemon.sh -u     # uninstall
+```
+
+Verify it's producing data:
+
+```
+cat /tmp/hardware-bar-powermetrics.json                      # gpu_pct / *_power_w within ~2s
+sudo /usr/bin/python3 macos/powermetrics_daemon.py --dump    # inspect raw powermetrics keys
+```
+
+The plist key names powermetrics uses for GPU residency/power vary across macOS releases;
+the parser (`macos/powermetrics_daemon.py`) searches the common locations. If GPU%/power
+stay `--` after install, run `--dump` and adjust `parse_sample()` to match your build.
+
+## macOS Loupedeck wiring
+
+Point each Loupedeck command at the venv Python with the module form, working dir =
+project root — same model as Windows, different paths:
+
+```
+Command: ~/Developer/mac-bar/.venv/bin/python
+Args:    -m brightness.client 0 +5      (CW/CCW dial -> per-display brightness)
+         -m audio --vol +5              (volume up)
+         -m audio --cycle               (cycle output device)
+         -m nightlight --toggle         (Night Shift)
+         -m bar.charts cpu              (toggle a live chart)
+Working dir: ~/Developer/mac-bar
+```
+
+Thin wrappers are provided in `scripts/launchers/mac/` (`brightness.sh`, `audio.sh`,
+`nightlight.sh`, `charts.sh`, `meross.sh`, and `run.command`) if you'd rather bind to a
+script than a python invocation.
+
+> The sections below document the **Windows** implementation details. On macOS
+> these capabilities use native frameworks/CLIs instead — see *Platform support*
+> and *First-time setup — macOS* above; the `python -m <module>` CLIs are
+> identical (swap `.venv\Scripts\python.exe` for `.venv/bin/python`).
+
+## LibreHardwareMonitor — Windows (CPU + SSD temps, CPU power, fan tachos)
 
 LHM provides CPU package temp/power and the disk temps/activity the bar shows.
 It needs admin rights (CPU MSR access) and its HTTP remote server on port 8085.
@@ -285,59 +390,77 @@ Supported metric names: keys of `METRICS` in `bar/charts.py` (e.g. `cpu`,
 `cpu-gpu`, `temps`). Window positions persist under `.charts/`
 (gitignored). Log at `%TEMP%\hardware-bar-charts.log`.
 
+On macOS the metric set is retuned for the unified SoC: `gpu-temp` and `disk`
+(activity) are dropped (no discrete GPU temperature, no per-drive activity), the
+`disk-temps`/`temps` charts track the single internal SSD, CPU charts use a
+0–100% range (no Turbo), and the RAM range follows installed memory.
+
 ## Project layout
 
+Platform backends are split into `_win.py` / `_mac.py` behind each module's
+`core.py` dispatcher; pure, OS-free logic lives in leaf modules (`_blob.py`,
+`_scale.py`, `model.py`) so the unit tests run on any OS.
+
 ```
-hardware-bar/
+hardware-bar/  (cloned as mac-bar/ on macOS)
 ├── README.md
-├── requirements.txt
-├── config.local.json                          saved bar position (gitignored)
+├── requirements.txt                          env-marker deps (Windows vs macOS)
+├── _common.py                                shared helpers + IS_WINDOWS/IS_MACOS flags
+├── config.local.json                         saved bar position (gitignored)
 │
 ├── bar/                                       always-on-top bar + live charts
 │   ├── __main__.py                            `python -m bar`
-│   ├── main.py                                Qt UI, Poller, Sample
+│   ├── main.py                                Qt UI, Poller, render (cross-platform)
+│   ├── model.py                               Sample/DiskReading + LHM JSON parser (pure)
+│   ├── sensors.py                             make_backend() -> Windows/Mac sensor backend
+│   ├── _win.py                                PDH CPU + pynvml GPU + LHM HTTP + schtasks
+│   ├── _mac.py                                psutil + IOHID temps + SMC fans + powermetrics
+│   ├── iohid.py                               SoC/SSD temperature sensors (macOS, no sudo)
+│   ├── smc.py                                 AppleSMC fan RPM (macOS, no sudo)
+│   ├── macwin.py                              macOS accessory mode + all-Spaces floating
 │   └── charts.py                              `python -m bar.charts <metric>`
 │
-├── brightness/                                DDC/CI + HDR SDR-white-level control
+├── brightness/                                per-monitor brightness control
 │   ├── __main__.py                            `python -m brightness` (offline CLI)
-│   ├── core.py                                enumeration, HDR detection, DDC helpers
+│   ├── core.py                                platform dispatcher + offline CLI
+│   ├── _scale.py                              SDR white-level <-> percent math (pure, tested)
+│   ├── _win.py                                DisplayConfig DDC/CI + HDR SDRWhiteLevel
+│   ├── _mac.py                                DisplayServices (built-in) + m1ddc (external)
+│   ├── _displayservices.py                    built-in-panel brightness via ctypes (macOS)
+│   ├── protocol.py                            dependency-free wire constants + status codec
 │   ├── daemon.py                              `python -m brightness.daemon`
 │   └── client.py                              `python -m brightness.client` (Loupedeck)
 │
-├── nightlight/                                Windows 11 Night Light toggle
+├── nightlight/                                blue-light toggle (Night Light / Night Shift)
 │   ├── __main__.py                            `python -m nightlight`
-│   └── core.py                                registry-blob manipulation + public API
+│   ├── core.py                                platform dispatcher + CLI
+│   ├── _blob.py                               Night Light registry-blob codec (pure, tested)
+│   ├── _win.py                                Windows registry read/write
+│   └── _mac.py                                Night Shift via the `nightlight` CLI
 │
 ├── audio/                                     master volume / mute / output cycling
 │   ├── __main__.py                            `python -m audio`
-│   └── core.py                                pycaw wrappers + IPolicyConfig switch
+│   ├── core.py                                platform dispatcher + CLI
+│   ├── _types.py, _filter.py                  OutputDevice + output-filter file (shared)
+│   ├── _win.py                                pycaw + IPolicyConfig COM
+│   └── _mac.py                                osascript volume/mute + SwitchAudioSource
 │
-├── discovery/                                 LAN reconnaissance (mDNS + SSDP)
-│   ├── __main__.py                            `python -m discovery`
-│   └── core.py                                zeroconf probe + raw SSDP socket
+├── discovery/                                 LAN reconnaissance (mDNS + SSDP, cross-platform)
+├── meross/                                    Meross smart-plug control (cross-platform)
 │
-├── meross/                                    Meross smart-plug control
-│   ├── __main__.py                            `python -m meross`
-│   ├── core.py                                meross_iot async wrapped sync
-│   └── chart.py                               `python -m meross.chart` — stacked-area energy chart
+├── macos/                                     macOS-only privileged helper
+│   └── powermetrics_daemon.py                root sampler -> GPU%/power JSON (stdlib only)
 │
 ├── scripts/
-│   ├── launchers/                             manual / Loupedeck launchers
-│   │   ├── run.bat                            start the bar silently
-│   │   ├── charts.bat, charts-debug.bat       pythonw / python wrappers
-│   │   ├── brightness-debug.bat               visible-console brightness CLI
-│   │   ├── brightness-daemon.bat              silent daemon launch (manual)
-│   │   ├── brightness-daemon-debug.bat        visible daemon launch (debug)
-│   │   ├── nightlight-debug.bat               visible-console nightlight CLI
-│   │   ├── audio-debug.bat                    visible-console audio CLI
-│   │   └── meross-debug.bat                   visible-console meross CLI
+│   ├── launchers/                             Windows .bat launchers
+│   │   └── mac/                               macOS launchers: run.command + *.sh wrappers
 │   └── install/                               one-time installers
-│       ├── register-lhm-task.bat / .ps1       admin on-demand task for LHM (no autostart)
-│       ├── install-bar-autostart.bat / .ps1   user Startup shortcut for the bar (legacy)
-│       └── install-brightness-daemon-autostart.bat / .ps1   ditto for the daemon (legacy)
+│       ├── register-lhm-task.bat / .ps1       admin on-demand task for LHM (Windows)
+│       ├── install-powermetrics-daemon.sh     LaunchDaemon for GPU%/power (macOS)
+│       └── install-*-autostart.bat / .ps1     legacy Windows Startup shortcuts
 │
 └── vendor/
-    └── LibreHardwareMonitor/                  vendored LHM (gitignored)
+    └── LibreHardwareMonitor/                  vendored LHM (gitignored, Windows)
 ```
 
 ## Migrating existing Loupedeck bindings

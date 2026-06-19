@@ -183,7 +183,7 @@ def serve() -> int:
 
     try:
         refresh_displays()
-    except Exception as e:
+    except Exception:
         log.exception("initial refresh failed")
         return 1
 
