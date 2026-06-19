@@ -20,6 +20,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+# Platform flags — used across the project to pick OS-specific backends.
+# The hardware bar started life Windows-only (LibreHardwareMonitor, pycaw,
+# DDC/CI + SDRWhiteLevel, the Night Light registry blob); the macOS port keeps
+# the same public APIs but swaps in Darwin backends behind these flags.
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+
 SAMPLE_FILE = Path(tempfile.gettempdir()) / "hardware-bar-sample.json"
 SAMPLE_STALE_S = 3.0  # > REFRESH_MS * 2; older = bar not running
 

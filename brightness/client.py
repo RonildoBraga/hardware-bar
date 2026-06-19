@@ -49,19 +49,25 @@ def _spawn_daemon() -> None:
     start the daemon manually before using the brightness dials. Costs
     ~500ms on the first dial press of a session; subsequent presses hit
     the live daemon.
+
+    Detaching differs per OS: Windows uses DETACHED_PROCESS +
+    CREATE_NEW_PROCESS_GROUP; POSIX uses start_new_session (setsid).
     """
-    DETACHED_PROCESS = 0x00000008
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
     root = Path(__file__).resolve().parent.parent
-    subprocess.Popen(
-        [sys.executable, "-m", "brightness.daemon"],
+    kwargs: dict = dict(
         cwd=str(root),
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    if sys.platform == "win32":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True  # setsid: survive client exit
+    subprocess.Popen([sys.executable, "-m", "brightness.daemon"], **kwargs)
 
 
 def _wait_for_daemon(timeout_s: float = 2.0) -> bool:
